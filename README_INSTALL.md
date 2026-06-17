@@ -2,6 +2,31 @@
 
 本文件說明如何在這台 Linux 主機上安裝、部署與初始化 LiteLLM Proxy 服務。
 
+---
+
+## 🌐 環境規劃與部署工作流 (Environments & Workflow)
+
+本系統採雙機架構：
+* **本機 spark1 (10.115.140.130)**：**實驗與開發驗證環境** (Dev/Experimental)。
+  * 所有的配置修改、鏡像更新或環境參數調整，都必須先在 `spark1` 本機進行測試。
+* **遠端 spark3 (10.115.140.188)**：**正式服務環境** (Production/Prod)。
+  * 只有在 `spark1` 本機驗證無誤、QC Check 通過後，才可以同步並部署到 `spark3`。
+
+### 🔄 從 spark1 同步並部署至 spark3 的指令
+當本機 `spark1` 的修改驗證通過後，請於 `spark1` 執行以下指令同步至 `spark3`：
+```bash
+# 進入本機部署目錄
+cd /opt/litellm
+
+# 同步部署檔案與 Git 歷史到 spark3
+rsync -avz /opt/litellm/ spark3:/opt/litellm/
+
+# 登入 spark3 執行服務重新加載
+ssh spark3 "cd /opt/litellm && ./restart.sh"
+```
+
+---
+
 ## 📋 系統前提需求
 * **作業系統**：Linux
 * **容器引擎**：Docker Engine (已驗證且已安裝)

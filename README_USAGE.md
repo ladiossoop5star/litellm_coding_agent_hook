@@ -2,6 +2,12 @@
 
 本文件說明如何使用此 LiteLLM Proxy 服務，包含常用 API 端點調用範例、可能需要修改的設定參數。
 
+> ⚠️ **環境部署策略重要提醒**
+> * **本機 spark1 (10.115.140.130)**：實驗與開發環境。所有變更必須先在此處測試與驗證。
+> * **遠端 spark3 (10.115.140.188)**：正式服務主機。僅在 `spark1` 驗證完畢後，方可同步並部署至 `spark3`。
+
+---
+
 ## 🔑 認證資訊
 * **API Key**：`wpd-local-llm`
 * **HTTP Header**：`Authorization: Bearer wpd-local-llm`
@@ -33,7 +39,7 @@
 如果上游模型更新或更換，您需要調整以下欄位：
 * `litellm_params.max_tokens`：單次輸出的 Token 限制。
 * `litellm_params.model_info.max_tokens`：模型總 Token容量限制。
-* `litellm_params.model_info.max_input_tokens`：單次輸入的 Token 限制。
+* `litellm_params.model_info.max_input_tokens`：單次輸入 the Token 限制。
 * `litellm_params.model_info.max_output_tokens`：單次輸出的 Token 限制。
 
 ### 3. 全域代理路由設定 (litellm_settings)
