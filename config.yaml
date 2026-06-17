@@ -38,10 +38,26 @@ model_list:
       max_input_tokens: 458752
       max_output_tokens: 65536
 
+  - model_name: deepseek-spark5
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: http://10.115.140.132:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 65536
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 1000000
+      max_input_tokens: 934464
+      max_output_tokens: 65536
+
 router_settings:
   model_group_alias:
     claude-sonnet-4-6: qwen-spark1
     claude-opus-4-8: deepseek-spark3
+    claude-opus-4-7: deepseek-spark5
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
