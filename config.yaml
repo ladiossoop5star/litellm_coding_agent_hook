@@ -16,7 +16,7 @@ model_list:
       custom_endpoint: true
       use_chat_completions_api: true
       max_tokens: 32768
-      additional_drop_params: ["tools"]
+
       merge_reasoning_content_in_choices: true
     model_info:
       max_tokens: 262144
@@ -31,7 +31,7 @@ model_list:
       custom_endpoint: true
       use_chat_completions_api: true
       max_tokens: 65536
-      additional_drop_params: ["tools"]
+
       merge_reasoning_content_in_choices: true
     model_info:
       max_tokens: 524288
