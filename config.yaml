@@ -1,0 +1,38 @@
+model_list:
+  - model_name: qwen-spark1
+    litellm_params:
+      model: openai/qwen3.6-27b
+      api_base: http://10.115.140.130:8004/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+      additional_drop_params: ["tools"]
+      merge_reasoning_content_in_choices: true
+      model_info:
+        max_tokens: 262144
+        max_input_tokens: 229376
+        max_output_tokens: 32768
+
+  - model_name: deepseek-spark3
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: http://10.115.140.188:8000/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 65536
+      additional_drop_params: ["tools"]
+      merge_reasoning_content_in_choices: true
+      model_info:
+        max_tokens: 524288
+        max_input_tokens: 458752
+        max_output_tokens: 65536
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  use_chat_completions_url_for_anthropic_messages: true
