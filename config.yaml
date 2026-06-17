@@ -18,10 +18,10 @@ model_list:
       max_tokens: 32768
       additional_drop_params: ["tools"]
       merge_reasoning_content_in_choices: true
-      model_info:
-        max_tokens: 262144
-        max_input_tokens: 229376
-        max_output_tokens: 32768
+    model_info:
+      max_tokens: 262144
+      max_input_tokens: 229376
+      max_output_tokens: 32768
 
   - model_name: deepseek-spark3
     litellm_params:
@@ -33,10 +33,15 @@ model_list:
       max_tokens: 65536
       additional_drop_params: ["tools"]
       merge_reasoning_content_in_choices: true
-      model_info:
-        max_tokens: 524288
-        max_input_tokens: 458752
-        max_output_tokens: 65536
+    model_info:
+      max_tokens: 524288
+      max_input_tokens: 458752
+      max_output_tokens: 65536
+
+router_settings:
+  model_group_alias:
+    claude-sonnet-4-6: qwen-spark1
+    claude-opus-4-8: deepseek-spark3
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
