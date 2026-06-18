@@ -11,7 +11,7 @@ model_list:
   - model_name: qwen-pgc2
     litellm_params:
       model: openai/qwen3.6-27b-ud-q8-xl
-      api_base: http://10.115.140.137:9527/v1
+      api_base: http://10.115.140.137:9526/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
@@ -26,7 +26,7 @@ model_list:
   - model_name: qwen-spark1
     litellm_params:
       model: openai/qwen3.6-27b
-      api_base: http://10.115.140.130:8004/v1
+      api_base: http://10.115.140.130:9526/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
