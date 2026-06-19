@@ -260,6 +260,13 @@ def _sse(event_name: str, payload: Dict[str, Any], original: Any) -> Any:
     return _encode_like(text, original)
 
 
+def _is_complete_json_object(text: str) -> bool:
+    try:
+        return isinstance(json.loads(text), dict)
+    except Exception:
+        return False
+
+
 def _messages_text_delta(text: str, index: int, original: Any) -> Any:
     return _sse(
         "content_block_delta",
@@ -504,6 +511,7 @@ class OpencodeCompatHandler(CustomLogger):
         sse_buffer = ""
         text_block_index = 0
         native_tool_index: Optional[int] = None
+        native_tool_json = ""
         passthrough_blocked = False
         original_for_output: Any = b""
 
@@ -547,6 +555,14 @@ class OpencodeCompatHandler(CustomLogger):
                             else:
                                 yield item
                         continue
+                    if (
+                        stop_after_first_native_tool
+                        and native_tool_index is not None
+                        and int(payload.get("index", -1) or -1) == native_tool_index
+                        and delta.get("type") == "input_json_delta"
+                        and isinstance(delta.get("partial_json"), str)
+                    ):
+                        native_tool_json += delta["partial_json"]
 
                 if dsml_mode or passthrough_blocked:
                     continue
@@ -566,6 +582,25 @@ class OpencodeCompatHandler(CustomLogger):
                     text_buffer = ""
 
                 yield _encode_like(raw_event + "\n\n", chunk)
+
+                if (
+                    stop_after_first_native_tool
+                    and native_tool_index is not None
+                    and event_name == "content_block_delta"
+                    and _is_complete_json_object(native_tool_json)
+                ):
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": native_tool_index}, chunk)
+                    yield _sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                            "usage": {"output_tokens": 0},
+                        },
+                        chunk,
+                    )
+                    yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                    return
 
                 if (
                     stop_after_first_native_tool
