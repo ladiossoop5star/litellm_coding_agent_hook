@@ -9,6 +9,7 @@ services:
       - "4000:4000"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      - ./opencode_compat_hook:/app/opencode_compat_hook:ro
     command:
       - "--config"
       - "/app/config.yaml"
