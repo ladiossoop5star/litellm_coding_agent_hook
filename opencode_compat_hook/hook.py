@@ -21,6 +21,7 @@ log = logging.getLogger("opencode_compat_hook")
 SECTION_SIZE = 32
 GUARD_SECTIONS = 2
 ASSISTANT_PLACEHOLDER = "."
+STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -162,21 +163,21 @@ def _should_skip_stream_conversion(request_data: Optional[dict]) -> bool:
     return False
 
 
-def _model_group(request_data: Optional[dict]) -> str:
+def _request_model_names(request_data: Optional[dict]) -> set[str]:
     if not request_data:
-        return ""
+        return set()
     metadata = request_data.get("litellm_metadata") or {}
-    values = [
+    values = {
         request_data.get("model"),
         metadata.get("model_group"),
         metadata.get("deployment"),
         metadata.get("deployment_model_name"),
-    ]
-    return " ".join(str(value) for value in values if value)
+    }
+    return {str(value) for value in values if value}
 
 
 def _stop_after_first_native_tool(request_data: Optional[dict]) -> bool:
-    return "deepseek-spark5" in _model_group(request_data)
+    return any(STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER in name.lower() for name in _request_model_names(request_data))
 
 
 def convert_non_streaming_response(response: Any) -> Any:
