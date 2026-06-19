@@ -20,6 +20,7 @@ log = logging.getLogger("opencode_compat_hook")
 
 SECTION_SIZE = 32
 GUARD_SECTIONS = 2
+ASSISTANT_PLACEHOLDER = "."
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -185,6 +186,33 @@ def convert_non_streaming_response(response: Any) -> Any:
     return response
 
 
+def _has_anthropic_text_or_tool_use(content: List[Any]) -> bool:
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "tool_use":
+            return True
+        if part_type == "text" and str(part.get("text") or "").strip():
+            return True
+    return False
+
+
+def _normalize_assistant_messages(messages: Any) -> None:
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+
+        content = msg.get("content")
+        if isinstance(content, list):
+            if not _has_anthropic_text_or_tool_use(content):
+                content.append({"type": "text", "text": ASSISTANT_PLACEHOLDER})
+            continue
+
+        if not content and not msg.get("tool_calls"):
+            msg["content"] = ASSISTANT_PLACEHOLDER
+
+
 def _encode_like(text: str, original: Any) -> Any:
     if isinstance(original, (bytes, bytearray)):
         return text.encode("utf-8")
@@ -306,20 +334,17 @@ class OpencodeCompatHandler(CustomLogger):
             log.warning("failed to register /v1/responses/input_tokens route: %s", exc)
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
-        if call_type not in ("completion", "acompletion", "chat_completion"):
+        if call_type in ("completion", "acompletion", "chat_completion"):
+            tools = data.get("tools")
+            if isinstance(tools, list):
+                data["tools"] = [tool for tool in tools if isinstance(tool, dict) and tool.get("type") == "function"]
+                if not data["tools"]:
+                    data.pop("tools", None)
+
+        if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
             return data
 
-        tools = data.get("tools")
-        if isinstance(tools, list):
-            data["tools"] = [tool for tool in tools if isinstance(tool, dict) and tool.get("type") == "function"]
-            if not data["tools"]:
-                data.pop("tools", None)
-
-        for msg in data.get("messages", []) or []:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") == "assistant" and not msg.get("content") and not msg.get("tool_calls"):
-                msg["content"] = " "
+        _normalize_assistant_messages(data.get("messages"))
         return data
 
     async def async_post_call_success_hook(self, data: dict, user_api_key_dict: Any, response: Any) -> Any:
