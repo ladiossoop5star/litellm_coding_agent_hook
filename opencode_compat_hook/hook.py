@@ -162,6 +162,23 @@ def _should_skip_stream_conversion(request_data: Optional[dict]) -> bool:
     return False
 
 
+def _model_group(request_data: Optional[dict]) -> str:
+    if not request_data:
+        return ""
+    metadata = request_data.get("litellm_metadata") or {}
+    values = [
+        request_data.get("model"),
+        metadata.get("model_group"),
+        metadata.get("deployment"),
+        metadata.get("deployment_model_name"),
+    ]
+    return " ".join(str(value) for value in values if value)
+
+
+def _stop_after_first_native_tool(request_data: Optional[dict]) -> bool:
+    return "deepseek-spark5" in _model_group(request_data)
+
+
 def convert_non_streaming_response(response: Any) -> Any:
     choice = _choice(response)
     if choice is None:
@@ -354,7 +371,10 @@ class OpencodeCompatHandler(CustomLogger):
         self, user_api_key_dict: Any, response: Any, request_data: dict
     ) -> AsyncGenerator[Any, None]:
         if _is_messages_stream(request_data):
-            async for chunk in self._convert_anthropic_messages_stream(response):
+            async for chunk in self._convert_anthropic_messages_stream(
+                response,
+                stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
+            ):
                 yield chunk
             return
 
@@ -471,13 +491,18 @@ class OpencodeCompatHandler(CustomLogger):
 
         yield _make_stream_chunk(last_id, last_model, last_created, {"content": ""}, finish_reason="stop")
 
-    async def _convert_anthropic_messages_stream(self, response: Any) -> AsyncGenerator[Any, None]:
+    async def _convert_anthropic_messages_stream(
+        self,
+        response: Any,
+        stop_after_first_native_tool: bool = False,
+    ) -> AsyncGenerator[Any, None]:
         text_buffer = ""
         unflushed_text = ""
         pending: List[str] = []
         dsml_mode = False
         sse_buffer = ""
         text_block_index = 0
+        native_tool_index: Optional[int] = None
         passthrough_blocked = False
         original_for_output: Any = b""
 
@@ -527,6 +552,9 @@ class OpencodeCompatHandler(CustomLogger):
 
                 if event_name == "content_block_start":
                     text_block_index = int(payload.get("index", text_block_index) or 0)
+                    content_block = payload.get("content_block") or {}
+                    if content_block.get("type") == "tool_use" and native_tool_index is None:
+                        native_tool_index = text_block_index
                 elif event_name in {"content_block_stop", "message_delta", "message_stop"}:
                     for item in pending:
                         yield _messages_text_delta(item, text_block_index, chunk)
@@ -537,6 +565,24 @@ class OpencodeCompatHandler(CustomLogger):
                     text_buffer = ""
 
                 yield _encode_like(raw_event + "\n\n", chunk)
+
+                if (
+                    stop_after_first_native_tool
+                    and native_tool_index is not None
+                    and event_name == "content_block_stop"
+                    and int(payload.get("index", -1) or -1) == native_tool_index
+                ):
+                    yield _sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                            "usage": {"output_tokens": 0},
+                        },
+                        chunk,
+                    )
+                    yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                    return
 
         if dsml_mode:
             idx = find_raw_tool_start(text_buffer)
