@@ -1,7 +1,8 @@
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional
+import uuid
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Tuple
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.types.utils import ModelResponseStream
@@ -139,16 +140,22 @@ def _request_url(request_data: Optional[dict]) -> str:
     return ""
 
 
+def _is_messages_stream(request_data: Optional[dict]) -> bool:
+    if not request_data:
+        return False
+    call_type = str(request_data.get("call_type") or "")
+    if call_type == "anthropic_messages":
+        return True
+    url = _request_url(request_data)
+    return "/v1/messages" in url or "/messages" in url
+
+
 def _should_skip_stream_conversion(request_data: Optional[dict]) -> bool:
     if not request_data:
         return False
 
     call_type = str(request_data.get("call_type") or "")
-    if call_type in {"anthropic_messages", "pass_through_endpoint"}:
-        return True
-
-    url = _request_url(request_data)
-    if "/v1/messages" in url or "/messages" in url:
+    if call_type == "pass_through_endpoint":
         return True
 
     return False
@@ -176,6 +183,86 @@ def convert_non_streaming_response(response: Any) -> Any:
     _set(choice, "finish_reason", "tool_calls")
     log.info("converted %d non-stream tool_calls", len(parsed))
     return response
+
+
+def _encode_like(text: str, original: Any) -> Any:
+    if isinstance(original, (bytes, bytearray)):
+        return text.encode("utf-8")
+    return text
+
+
+def _parse_sse_event(raw_event: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    event_name: Optional[str] = None
+    data_lines: List[str] = []
+    for line in raw_event.splitlines():
+        if line.startswith("event:"):
+            event_name = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+    if not data_lines:
+        return event_name, None
+    data = "\n".join(data_lines)
+    try:
+        return event_name, json.loads(data)
+    except Exception:
+        return event_name, None
+
+
+def _sse(event_name: str, payload: Dict[str, Any], original: Any) -> Any:
+    text = "event: " + event_name + "\n"
+    text += "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    return _encode_like(text, original)
+
+
+def _messages_text_delta(text: str, index: int, original: Any) -> Any:
+    return _sse(
+        "content_block_delta",
+        {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}},
+        original,
+    )
+
+
+def _messages_tool_use_events(tool_calls: Iterable[Dict[str, Any]], start_index: int, original: Any) -> List[Any]:
+    events: List[Any] = []
+    index = start_index
+    for tc in tool_calls:
+        fn = tc["function"]
+        tool_id = "toolu_" + uuid.uuid4().hex[:24]
+        args = fn.get("arguments") or "{}"
+        events.append(
+            _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "tool_use", "id": tool_id, "name": fn["name"], "input": {}},
+                },
+                original,
+            )
+        )
+        events.append(
+            _sse(
+                "content_block_delta",
+                {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": args}},
+                original,
+            )
+        )
+        events.append(_sse("content_block_stop", {"type": "content_block_stop", "index": index}, original))
+        index += 1
+
+    events.append(
+        _sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            },
+            original,
+        )
+    )
+    events.append(_sse("message_stop", {"type": "message_stop"}, original))
+    return events
 
 
 class OpencodeCompatHandler(CustomLogger):
@@ -241,6 +328,11 @@ class OpencodeCompatHandler(CustomLogger):
     async def async_post_call_streaming_iterator_hook(
         self, user_api_key_dict: Any, response: Any, request_data: dict
     ) -> AsyncGenerator[Any, None]:
+        if _is_messages_stream(request_data):
+            async for chunk in self._convert_anthropic_messages_stream(response):
+                yield chunk
+            return
+
         if _should_skip_stream_conversion(request_data):
             async for chunk in response:
                 yield chunk
@@ -353,6 +445,181 @@ class OpencodeCompatHandler(CustomLogger):
                 yield _make_content_chunk(last_id, last_model, last_created, unflushed_text)
 
         yield _make_stream_chunk(last_id, last_model, last_created, {"content": ""}, finish_reason="stop")
+
+    async def _convert_anthropic_messages_stream(self, response: Any) -> AsyncGenerator[Any, None]:
+        text_buffer = ""
+        unflushed_text = ""
+        pending: List[str] = []
+        dsml_mode = False
+        sse_buffer = ""
+        text_block_index = 0
+        passthrough_blocked = False
+        original_for_output: Any = b""
+
+        async for chunk in response:
+            original_for_output = chunk
+            chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+            sse_buffer += chunk_text
+
+            while "\n\n" in sse_buffer:
+                raw_event, sse_buffer = sse_buffer.split("\n\n", 1)
+                if not raw_event:
+                    continue
+
+                event_name, payload = _parse_sse_event(raw_event)
+                if payload is None:
+                    if not passthrough_blocked:
+                        yield _encode_like(raw_event + "\n\n", chunk)
+                    continue
+
+                if event_name == "content_block_delta":
+                    delta = payload.get("delta") or {}
+                    if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                        text_block_index = int(payload.get("index", text_block_index) or 0)
+                        async for item in self._handle_messages_text_delta(
+                            delta["text"],
+                            text_block_index,
+                            chunk,
+                            state={
+                                "text_buffer": text_buffer,
+                                "unflushed_text": unflushed_text,
+                                "pending": pending,
+                                "dsml_mode": dsml_mode,
+                            },
+                        ):
+                            if isinstance(item, dict) and item.get("_state"):
+                                text_buffer = item["text_buffer"]
+                                unflushed_text = item["unflushed_text"]
+                                pending = item["pending"]
+                                dsml_mode = item["dsml_mode"]
+                                passthrough_blocked = item["passthrough_blocked"]
+                            else:
+                                yield item
+                        continue
+
+                if dsml_mode or passthrough_blocked:
+                    continue
+
+                if event_name == "content_block_start":
+                    text_block_index = int(payload.get("index", text_block_index) or 0)
+                elif event_name in {"content_block_stop", "message_delta", "message_stop"}:
+                    for item in pending:
+                        yield _messages_text_delta(item, text_block_index, chunk)
+                    pending = []
+                    if unflushed_text:
+                        yield _messages_text_delta(unflushed_text, text_block_index, chunk)
+                        unflushed_text = ""
+                    text_buffer = ""
+
+                yield _encode_like(raw_event + "\n\n", chunk)
+
+        if dsml_mode:
+            idx = find_raw_tool_start(text_buffer)
+            if idx > 0:
+                yield _messages_text_delta(text_buffer[:idx], text_block_index, original_for_output)
+            if idx < len(text_buffer):
+                yield _messages_text_delta(text_buffer[idx:], text_block_index, original_for_output)
+        else:
+            for item in pending:
+                yield _messages_text_delta(item, text_block_index, original_for_output)
+            if unflushed_text:
+                yield _messages_text_delta(unflushed_text, text_block_index, original_for_output)
+
+        if sse_buffer and not passthrough_blocked:
+            yield _encode_like(sse_buffer, original_for_output)
+
+    async def _handle_messages_text_delta(
+        self,
+        text: str,
+        text_block_index: int,
+        original: Any,
+        state: Dict[str, Any],
+    ) -> AsyncGenerator[Any, None]:
+        text_buffer = state["text_buffer"] + text
+        unflushed_text = state["unflushed_text"]
+        pending: List[str] = state["pending"]
+        dsml_mode = state["dsml_mode"]
+        passthrough_blocked = False
+
+        if has_complete_raw_tool_block(text_buffer):
+            idx = find_raw_tool_start(text_buffer)
+            if idx > 0 and not dsml_mode:
+                yield _messages_text_delta(text_buffer[:idx], text_block_index, original)
+
+            parsed = parse_raw_tool_calls(normalize_raw_tool_calls(text_buffer))
+            if parsed:
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index}, original)
+                for event in _messages_tool_use_events(parsed, text_block_index + 1, original):
+                    yield event
+                yield {
+                    "_state": True,
+                    "text_buffer": "",
+                    "unflushed_text": "",
+                    "pending": [],
+                    "dsml_mode": True,
+                    "passthrough_blocked": True,
+                }
+                return
+
+            yield _messages_text_delta(text_buffer[idx:], text_block_index, original)
+            yield {
+                "_state": True,
+                "text_buffer": "",
+                "unflushed_text": "",
+                "pending": [],
+                "dsml_mode": False,
+                "passthrough_blocked": False,
+            }
+            return
+
+        if dsml_mode:
+            yield {
+                "_state": True,
+                "text_buffer": text_buffer,
+                "unflushed_text": unflushed_text,
+                "pending": pending,
+                "dsml_mode": dsml_mode,
+                "passthrough_blocked": True,
+            }
+            return
+
+        if has_any_dsml_prefix(text_buffer):
+            dsml_mode = True
+            passthrough_blocked = True
+            for item in pending:
+                yield _messages_text_delta(item, text_block_index, original)
+            pending = []
+            if unflushed_text:
+                yield _messages_text_delta(unflushed_text, text_block_index, original)
+                unflushed_text = ""
+            idx = find_raw_tool_start(text_buffer)
+            if idx < len(text_buffer):
+                text_buffer = text_buffer[idx:]
+            yield {
+                "_state": True,
+                "text_buffer": text_buffer,
+                "unflushed_text": unflushed_text,
+                "pending": pending,
+                "dsml_mode": dsml_mode,
+                "passthrough_blocked": passthrough_blocked,
+            }
+            return
+
+        unflushed_text += text
+        while len(unflushed_text) >= SECTION_SIZE:
+            pending.append(unflushed_text[:SECTION_SIZE])
+            unflushed_text = unflushed_text[SECTION_SIZE:]
+            if len(pending) > GUARD_SECTIONS:
+                yield _messages_text_delta(pending.pop(0), text_block_index, original)
+
+        yield {
+            "_state": True,
+            "text_buffer": "".join(pending) + unflushed_text,
+            "unflushed_text": unflushed_text,
+            "pending": pending,
+            "dsml_mode": dsml_mode,
+            "passthrough_blocked": passthrough_blocked,
+        }
 
 
 proxy_handler_instance = OpencodeCompatHandler()
