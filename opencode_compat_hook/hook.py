@@ -181,26 +181,89 @@ def _stop_after_first_native_tool(request_data: Optional[dict]) -> bool:
 
 
 def convert_non_streaming_response(response: Any) -> Any:
+    if isinstance(response, dict) and isinstance(response.get("content"), list):
+        return _convert_anthropic_message_response(response)
+
     choice = _choice(response)
     if choice is None:
         return response
 
     msg = _message(choice)
     content = _get(msg, "content", "") or ""
+    reasoning = _get(msg, "reasoning_content", "") or _get(msg, "reasoning", "") or ""
     tool_calls = _get(msg, "tool_calls", None)
+    raw_text = content or reasoning
 
-    if tool_calls or not content or not has_complete_raw_tool_block(content):
+    if tool_calls or not raw_text or not has_complete_raw_tool_block(raw_text):
         return response
 
-    parsed = parse_raw_tool_calls(normalize_raw_tool_calls(content))
+    parsed = parse_raw_tool_calls(normalize_raw_tool_calls(raw_text))
     if not parsed:
-        log.warning("raw tool block detected but parse returned empty: %s", content[:600])
+        log.warning("raw tool block detected but parse returned empty: %s", raw_text[:600])
         return response
 
     _set(msg, "tool_calls", parsed)
     _set(msg, "content", None)
+    if reasoning:
+        _set(msg, "reasoning_content", None)
     _set(choice, "finish_reason", "tool_calls")
     log.info("converted %d non-stream tool_calls", len(parsed))
+    return response
+
+
+def _tool_input(arguments: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(arguments or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _convert_anthropic_message_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    content = response.get("content") or []
+    if not isinstance(content, list):
+        return response
+
+    for index, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        text = block.get("thinking") if block.get("type") == "thinking" else block.get("text")
+        if not isinstance(text, str) or not has_complete_raw_tool_block(text):
+            continue
+
+        parsed = parse_raw_tool_calls(normalize_raw_tool_calls(text))
+        if not parsed:
+            log.warning("anthropic raw tool block detected but parse returned empty: %s", text[:600])
+            return response
+
+        raw_start = find_raw_tool_start(text)
+        prefix = text[:raw_start].rstrip()
+        new_content: List[Dict[str, Any]] = []
+        new_content.extend(content[:index])
+        if prefix:
+            new_block = dict(block)
+            if new_block.get("type") == "thinking":
+                new_block["thinking"] = prefix
+            else:
+                new_block["text"] = prefix
+            new_content.append(new_block)
+
+        for tc in parsed:
+            fn = tc["function"]
+            new_content.append(
+                {
+                    "type": "tool_use",
+                    "id": tc.get("id") or "toolu_" + uuid.uuid4().hex[:24],
+                    "name": fn["name"],
+                    "input": _tool_input(fn.get("arguments") or "{}"),
+                }
+            )
+
+        response["content"] = new_content
+        response["stop_reason"] = "tool_use"
+        log.info("converted %d anthropic non-stream tool_use blocks", len(parsed))
+        return response
+
     return response
 
 
