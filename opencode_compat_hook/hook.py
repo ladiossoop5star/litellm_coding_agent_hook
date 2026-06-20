@@ -330,10 +330,11 @@ def _is_complete_json_object(text: str) -> bool:
         return False
 
 
-def _messages_text_delta(text: str, index: int, original: Any) -> Any:
+def _messages_text_delta(text: str, index: int, original: Any, delta_type: str = "text_delta") -> Any:
+    field = "thinking" if delta_type == "thinking_delta" else "text"
     return _sse(
         "content_block_delta",
-        {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}},
+        {"type": "content_block_delta", "index": index, "delta": {"type": delta_type, field: text}},
         original,
     )
 
@@ -573,6 +574,7 @@ class OpencodeCompatHandler(CustomLogger):
         dsml_mode = False
         sse_buffer = ""
         text_block_index = 0
+        text_delta_type = "text_delta"
         native_tool_index: Optional[int] = None
         native_tool_json = ""
         passthrough_blocked = False
@@ -596,12 +598,16 @@ class OpencodeCompatHandler(CustomLogger):
 
                 if event_name == "content_block_delta":
                     delta = payload.get("delta") or {}
-                    if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                    delta_type = str(delta.get("type") or "")
+                    delta_field = "thinking" if delta_type == "thinking_delta" else "text"
+                    if delta_type in {"text_delta", "thinking_delta"} and isinstance(delta.get(delta_field), str):
                         text_block_index = int(payload.get("index", text_block_index) or 0)
+                        text_delta_type = delta_type
                         async for item in self._handle_messages_text_delta(
-                            delta["text"],
+                            delta[delta_field],
                             text_block_index,
                             chunk,
+                            delta_type,
                             state={
                                 "text_buffer": text_buffer,
                                 "unflushed_text": unflushed_text,
@@ -637,10 +643,10 @@ class OpencodeCompatHandler(CustomLogger):
                         native_tool_index = text_block_index
                 elif event_name in {"content_block_stop", "message_delta", "message_stop"}:
                     for item in pending:
-                        yield _messages_text_delta(item, text_block_index, chunk)
+                        yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
                     pending = []
                     if unflushed_text:
-                        yield _messages_text_delta(unflushed_text, text_block_index, chunk)
+                        yield _messages_text_delta(unflushed_text, text_block_index, chunk, text_delta_type)
                         unflushed_text = ""
                     text_buffer = ""
 
@@ -686,14 +692,14 @@ class OpencodeCompatHandler(CustomLogger):
         if dsml_mode:
             idx = find_raw_tool_start(text_buffer)
             if idx > 0:
-                yield _messages_text_delta(text_buffer[:idx], text_block_index, original_for_output)
+                yield _messages_text_delta(text_buffer[:idx], text_block_index, original_for_output, text_delta_type)
             if idx < len(text_buffer):
-                yield _messages_text_delta(text_buffer[idx:], text_block_index, original_for_output)
+                yield _messages_text_delta(text_buffer[idx:], text_block_index, original_for_output, text_delta_type)
         else:
             for item in pending:
-                yield _messages_text_delta(item, text_block_index, original_for_output)
+                yield _messages_text_delta(item, text_block_index, original_for_output, text_delta_type)
             if unflushed_text:
-                yield _messages_text_delta(unflushed_text, text_block_index, original_for_output)
+                yield _messages_text_delta(unflushed_text, text_block_index, original_for_output, text_delta_type)
 
         if sse_buffer and not passthrough_blocked:
             yield _encode_like(sse_buffer, original_for_output)
@@ -703,6 +709,7 @@ class OpencodeCompatHandler(CustomLogger):
         text: str,
         text_block_index: int,
         original: Any,
+        delta_type: str,
         state: Dict[str, Any],
     ) -> AsyncGenerator[Any, None]:
         text_buffer = state["text_buffer"] + text
@@ -714,7 +721,7 @@ class OpencodeCompatHandler(CustomLogger):
         if has_complete_raw_tool_block(text_buffer):
             idx = find_raw_tool_start(text_buffer)
             if idx > 0 and not dsml_mode:
-                yield _messages_text_delta(text_buffer[:idx], text_block_index, original)
+                yield _messages_text_delta(text_buffer[:idx], text_block_index, original, delta_type)
 
             parsed = parse_raw_tool_calls(normalize_raw_tool_calls(text_buffer))
             if parsed:
@@ -731,7 +738,7 @@ class OpencodeCompatHandler(CustomLogger):
                 }
                 return
 
-            yield _messages_text_delta(text_buffer[idx:], text_block_index, original)
+            yield _messages_text_delta(text_buffer[idx:], text_block_index, original, delta_type)
             yield {
                 "_state": True,
                 "text_buffer": "",
@@ -757,10 +764,10 @@ class OpencodeCompatHandler(CustomLogger):
             dsml_mode = True
             passthrough_blocked = True
             for item in pending:
-                yield _messages_text_delta(item, text_block_index, original)
+                yield _messages_text_delta(item, text_block_index, original, delta_type)
             pending = []
             if unflushed_text:
-                yield _messages_text_delta(unflushed_text, text_block_index, original)
+                yield _messages_text_delta(unflushed_text, text_block_index, original, delta_type)
                 unflushed_text = ""
             idx = find_raw_tool_start(text_buffer)
             if idx < len(text_buffer):
@@ -780,7 +787,7 @@ class OpencodeCompatHandler(CustomLogger):
             pending.append(unflushed_text[:SECTION_SIZE])
             unflushed_text = unflushed_text[SECTION_SIZE:]
             if len(pending) > GUARD_SECTIONS:
-                yield _messages_text_delta(pending.pop(0), text_block_index, original)
+                yield _messages_text_delta(pending.pop(0), text_block_index, original, delta_type)
 
         yield {
             "_state": True,
