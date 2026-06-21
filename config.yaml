@@ -45,13 +45,13 @@ model_list:
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
-      max_tokens: 65536
+      max_tokens: 32768
 
       merge_reasoning_content_in_choices: true
     model_info:
       max_tokens: 524288
-      max_input_tokens: 458752
-      max_output_tokens: 65536
+      max_input_tokens: 491520
+      max_output_tokens: 32768
 
   - model_name: deepseek-spark5
     litellm_params:
@@ -60,13 +60,13 @@ model_list:
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
-      max_tokens: 65536
+      max_tokens: 32768
 
       merge_reasoning_content_in_choices: true
     model_info:
       max_tokens: 1000000
-      max_input_tokens: 934464
-      max_output_tokens: 65536
+      max_input_tokens: 967232
+      max_output_tokens: 32768
 
 router_settings:
   model_group_alias:
