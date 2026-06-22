@@ -22,6 +22,7 @@ SECTION_SIZE = 32
 GUARD_SECTIONS = 2
 ASSISTANT_PLACEHOLDER = "."
 STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
+RAW_THINK_PREVIEW_LIMIT = 200
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -340,7 +341,73 @@ def _messages_text_delta(text: str, index: int, original: Any, delta_type: str =
 
 
 def _raw_think_state() -> Dict[str, Any]:
-    return {"in_think": False, "tail": ""}
+    return {
+        "in_think": False,
+        "tail": "",
+        "started_at": None,
+        "suppressed_chars": 0,
+        "suppressed_chunks": 0,
+        "preview": "",
+        "visible_chars": 0,
+        "warned_unclosed": False,
+        "placeholder_emitted": False,
+    }
+
+
+def _record_raw_think_suppressed(text: str, state: Dict[str, Any]) -> None:
+    if not text:
+        return
+
+    if state.get("started_at") is None:
+        state["started_at"] = time.time()
+    state["suppressed_chars"] = int(state.get("suppressed_chars") or 0) + len(text)
+    state["suppressed_chunks"] = int(state.get("suppressed_chunks") or 0) + 1
+
+    preview = str(state.get("preview") or "")
+    if len(preview) < RAW_THINK_PREVIEW_LIMIT:
+        remaining = RAW_THINK_PREVIEW_LIMIT - len(preview)
+        state["preview"] = preview + text[:remaining]
+
+
+def _request_context(request_data: Optional[dict]) -> str:
+    names = sorted(_request_model_names(request_data))
+    metadata = (request_data or {}).get("litellm_metadata") or {}
+    pieces = []
+    if names:
+        pieces.append("models=" + ",".join(names))
+    for key in ("request_id", "litellm_call_id", "model_group", "deployment"):
+        value = metadata.get(key)
+        if value:
+            pieces.append(f"{key}={value}")
+    return " ".join(pieces) or "unknown-request"
+
+
+def _warn_unclosed_raw_think(state: Dict[str, Any], context: str) -> None:
+    if not state.get("in_think") or state.get("warned_unclosed"):
+        return
+
+    started_at = state.get("started_at")
+    duration = time.time() - started_at if isinstance(started_at, (int, float)) else 0.0
+    preview = str(state.get("preview") or "").replace("\n", "\\n")
+    log.warning(
+        "unclosed raw <think> suppressed context=%s chars=%s chunks=%s duration=%.1fs preview=%r",
+        context,
+        state.get("suppressed_chars") or 0,
+        state.get("suppressed_chunks") or 0,
+        duration,
+        preview,
+    )
+    state["warned_unclosed"] = True
+
+
+def _raw_think_placeholder(state: Dict[str, Any], context: str) -> str:
+    if not state.get("in_think"):
+        return ""
+    _warn_unclosed_raw_think(state, context)
+    if state.get("placeholder_emitted") or int(state.get("visible_chars") or 0) > 0:
+        return ""
+    state["placeholder_emitted"] = True
+    return ASSISTANT_PLACEHOLDER
 
 
 def _matching_prefix_suffix(text: str, marker: str) -> str:
@@ -366,8 +433,16 @@ def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
         if state.get("in_think"):
             close_idx = data.find(close_marker)
             if close_idx == -1:
-                state["tail"] = _matching_prefix_suffix(data, close_marker)
-                return "".join(output)
+                tail = _matching_prefix_suffix(data, close_marker)
+                if tail:
+                    _record_raw_think_suppressed(data[:-len(tail)], state)
+                else:
+                    _record_raw_think_suppressed(data, state)
+                state["tail"] = tail
+                visible = "".join(output)
+                state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
+                return visible
+            _record_raw_think_suppressed(data[:close_idx], state)
             data = data[close_idx + len(close_marker):]
             state["in_think"] = False
             continue
@@ -380,13 +455,18 @@ def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
                 state["tail"] = tail
             else:
                 output.append(data)
-            return "".join(output)
+            visible = "".join(output)
+            state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
+            return visible
 
         output.append(data[:open_idx])
         data = data[open_idx + len(open_marker):]
         state["in_think"] = True
+        state["started_at"] = time.time()
 
-    return "".join(output)
+    visible = "".join(output)
+    state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
+    return visible
 
 
 def _flush_raw_think_tail(state: Dict[str, Any]) -> str:
@@ -502,6 +582,7 @@ class OpencodeCompatHandler(CustomLogger):
             async for chunk in self._convert_anthropic_messages_stream(
                 response,
                 stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
+                request_context=_request_context(request_data),
             ):
                 yield chunk
             return
@@ -623,6 +704,7 @@ class OpencodeCompatHandler(CustomLogger):
         self,
         response: Any,
         stop_after_first_native_tool: bool = False,
+        request_context: str = "unknown-request",
     ) -> AsyncGenerator[Any, None]:
         text_buffer = ""
         unflushed_text = ""
@@ -704,6 +786,9 @@ class OpencodeCompatHandler(CustomLogger):
                     tail = _flush_raw_think_tail(raw_think)
                     if tail:
                         unflushed_text += tail
+                    placeholder = _raw_think_placeholder(raw_think, request_context)
+                    if placeholder:
+                        unflushed_text += placeholder
                     for item in pending:
                         yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
                     pending = []
@@ -761,6 +846,9 @@ class OpencodeCompatHandler(CustomLogger):
             tail = _flush_raw_think_tail(raw_think)
             if tail:
                 unflushed_text += tail
+            placeholder = _raw_think_placeholder(raw_think, request_context)
+            if placeholder:
+                unflushed_text += placeholder
             for item in pending:
                 yield _messages_text_delta(item, text_block_index, original_for_output, text_delta_type)
             if unflushed_text:
