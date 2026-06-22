@@ -339,6 +339,62 @@ def _messages_text_delta(text: str, index: int, original: Any, delta_type: str =
     )
 
 
+def _raw_think_state() -> Dict[str, Any]:
+    return {"in_think": False, "tail": ""}
+
+
+def _matching_prefix_suffix(text: str, marker: str) -> str:
+    max_len = min(len(text), len(marker) - 1)
+    for size in range(max_len, 0, -1):
+        if marker.startswith(text[-size:]):
+            return text[-size:]
+    return ""
+
+
+def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
+    """Drop raw <think>...</think> text from model deltas, including split markers."""
+    if not text:
+        return ""
+
+    open_marker = "<think>"
+    close_marker = "</think>"
+    data = str(state.get("tail") or "") + text
+    state["tail"] = ""
+    output: List[str] = []
+
+    while data:
+        if state.get("in_think"):
+            close_idx = data.find(close_marker)
+            if close_idx == -1:
+                state["tail"] = _matching_prefix_suffix(data, close_marker)
+                return "".join(output)
+            data = data[close_idx + len(close_marker):]
+            state["in_think"] = False
+            continue
+
+        open_idx = data.find(open_marker)
+        if open_idx == -1:
+            tail = _matching_prefix_suffix(data, open_marker)
+            if tail:
+                output.append(data[:-len(tail)])
+                state["tail"] = tail
+            else:
+                output.append(data)
+            return "".join(output)
+
+        output.append(data[:open_idx])
+        data = data[open_idx + len(open_marker):]
+        state["in_think"] = True
+
+    return "".join(output)
+
+
+def _flush_raw_think_tail(state: Dict[str, Any]) -> str:
+    tail = str(state.get("tail") or "")
+    state["tail"] = ""
+    return "" if state.get("in_think") else tail
+
+
 def _messages_tool_use_events(tool_calls: Iterable[Dict[str, Any]], start_index: int, original: Any) -> List[Any]:
     events: List[Any] = []
     index = start_index
@@ -575,6 +631,7 @@ class OpencodeCompatHandler(CustomLogger):
         sse_buffer = ""
         text_block_index = 0
         text_delta_type = "text_delta"
+        raw_think = _raw_think_state()
         native_tool_index: Optional[int] = None
         native_tool_json = ""
         passthrough_blocked = False
@@ -613,6 +670,7 @@ class OpencodeCompatHandler(CustomLogger):
                                 "unflushed_text": unflushed_text,
                                 "pending": pending,
                                 "dsml_mode": dsml_mode,
+                                "raw_think": raw_think,
                             },
                         ):
                             if isinstance(item, dict) and item.get("_state"):
@@ -620,6 +678,7 @@ class OpencodeCompatHandler(CustomLogger):
                                 unflushed_text = item["unflushed_text"]
                                 pending = item["pending"]
                                 dsml_mode = item["dsml_mode"]
+                                raw_think = item["raw_think"]
                                 passthrough_blocked = item["passthrough_blocked"]
                             else:
                                 yield item
@@ -642,6 +701,9 @@ class OpencodeCompatHandler(CustomLogger):
                     if content_block.get("type") == "tool_use" and native_tool_index is None:
                         native_tool_index = text_block_index
                 elif event_name in {"content_block_stop", "message_delta", "message_stop"}:
+                    tail = _flush_raw_think_tail(raw_think)
+                    if tail:
+                        unflushed_text += tail
                     for item in pending:
                         yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
                     pending = []
@@ -696,6 +758,9 @@ class OpencodeCompatHandler(CustomLogger):
             if idx < len(text_buffer):
                 yield _messages_text_delta(text_buffer[idx:], text_block_index, original_for_output, text_delta_type)
         else:
+            tail = _flush_raw_think_tail(raw_think)
+            if tail:
+                unflushed_text += tail
             for item in pending:
                 yield _messages_text_delta(item, text_block_index, original_for_output, text_delta_type)
             if unflushed_text:
@@ -716,6 +781,7 @@ class OpencodeCompatHandler(CustomLogger):
         unflushed_text = state["unflushed_text"]
         pending: List[str] = state["pending"]
         dsml_mode = state["dsml_mode"]
+        raw_think = state["raw_think"]
         passthrough_blocked = False
 
         if has_complete_raw_tool_block(text_buffer):
@@ -734,6 +800,7 @@ class OpencodeCompatHandler(CustomLogger):
                     "unflushed_text": "",
                     "pending": [],
                     "dsml_mode": True,
+                    "raw_think": raw_think,
                     "passthrough_blocked": True,
                 }
                 return
@@ -745,9 +812,12 @@ class OpencodeCompatHandler(CustomLogger):
                 "unflushed_text": "",
                 "pending": [],
                 "dsml_mode": False,
+                "raw_think": raw_think,
                 "passthrough_blocked": False,
             }
             return
+
+        safe_text = _strip_raw_think_delta(text, raw_think)
 
         if dsml_mode:
             yield {
@@ -756,6 +826,7 @@ class OpencodeCompatHandler(CustomLogger):
                 "unflushed_text": unflushed_text,
                 "pending": pending,
                 "dsml_mode": dsml_mode,
+                "raw_think": raw_think,
                 "passthrough_blocked": True,
             }
             return
@@ -778,11 +849,12 @@ class OpencodeCompatHandler(CustomLogger):
                 "unflushed_text": unflushed_text,
                 "pending": pending,
                 "dsml_mode": dsml_mode,
+                "raw_think": raw_think,
                 "passthrough_blocked": passthrough_blocked,
             }
             return
 
-        unflushed_text += text
+        unflushed_text += safe_text
         while len(unflushed_text) >= SECTION_SIZE:
             pending.append(unflushed_text[:SECTION_SIZE])
             unflushed_text = unflushed_text[SECTION_SIZE:]
@@ -791,10 +863,11 @@ class OpencodeCompatHandler(CustomLogger):
 
         yield {
             "_state": True,
-            "text_buffer": "".join(pending) + unflushed_text,
+            "text_buffer": text_buffer,
             "unflushed_text": unflushed_text,
             "pending": pending,
             "dsml_mode": dsml_mode,
+            "raw_think": raw_think,
             "passthrough_blocked": passthrough_blocked,
         }
 

@@ -41,7 +41,7 @@ model_list:
   - model_name: deepseek-spark3
     litellm_params:
       model: openai/deepseek-v4-flash
-      api_base: http://10.115.140.188:8000/v1
+      api_base: http://10.115.140.188:9527/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
@@ -64,8 +64,8 @@ model_list:
 
       merge_reasoning_content_in_choices: true
     model_info:
-      max_tokens: 1000000
-      max_input_tokens: 967232
+      max_tokens: 524288
+      max_input_tokens: 491520
       max_output_tokens: 32768
 
 router_settings:
