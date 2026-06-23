@@ -410,6 +410,36 @@ def _raw_think_placeholder(state: Dict[str, Any], context: str) -> str:
     return ASSISTANT_PLACEHOLDER
 
 
+def _raw_think_has_visible_output(
+    state: Dict[str, Any], pending: Iterable[str], unflushed_text: str
+) -> bool:
+    return (
+        int(state.get("visible_chars") or 0) > 0
+        or any(bool(item) for item in pending)
+        or bool(unflushed_text)
+    )
+
+
+def _raise_empty_unclosed_raw_think(
+    state: Dict[str, Any],
+    context: str,
+    pending: Iterable[str],
+    unflushed_text: str,
+    has_native_tool: bool,
+) -> None:
+    if not state.get("in_think") or has_native_tool:
+        return
+
+    _warn_unclosed_raw_think(state, context)
+    if _raw_think_has_visible_output(state, pending, unflushed_text):
+        return
+
+    raise RuntimeError(
+        "malformed model output: unclosed raw <think> produced an empty assistant turn "
+        f"({context})"
+    )
+
+
 def _matching_prefix_suffix(text: str, marker: str) -> str:
     max_len = min(len(text), len(marker) - 1)
     for size in range(max_len, 0, -1):
@@ -786,9 +816,21 @@ class OpencodeCompatHandler(CustomLogger):
                     tail = _flush_raw_think_tail(raw_think)
                     if tail:
                         unflushed_text += tail
-                    placeholder = _raw_think_placeholder(raw_think, request_context)
-                    if placeholder:
-                        unflushed_text += placeholder
+                    if event_name == "message_delta":
+                        delta = payload.get("delta") or {}
+                        stop_reason = delta.get("stop_reason")
+                        if stop_reason == "end_turn":
+                            _raise_empty_unclosed_raw_think(
+                                raw_think,
+                                request_context,
+                                pending,
+                                unflushed_text,
+                                native_tool_index is not None,
+                            )
+                        elif raw_think.get("in_think"):
+                            _warn_unclosed_raw_think(raw_think, request_context)
+                    elif event_name == "message_stop" and raw_think.get("in_think"):
+                        _warn_unclosed_raw_think(raw_think, request_context)
                     for item in pending:
                         yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
                     pending = []
@@ -846,9 +888,8 @@ class OpencodeCompatHandler(CustomLogger):
             tail = _flush_raw_think_tail(raw_think)
             if tail:
                 unflushed_text += tail
-            placeholder = _raw_think_placeholder(raw_think, request_context)
-            if placeholder:
-                unflushed_text += placeholder
+            if raw_think.get("in_think"):
+                _warn_unclosed_raw_think(raw_think, request_context)
             for item in pending:
                 yield _messages_text_delta(item, text_block_index, original_for_output, text_delta_type)
             if unflushed_text:

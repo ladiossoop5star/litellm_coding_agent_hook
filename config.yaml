@@ -72,6 +72,7 @@ router_settings:
   model_group_alias:
     claude-haiku-4-5-20251001: qwen-spark1
     claude-sonnet-4-6: qwen-spark1
+    claude-sonnet-4-5-20250929: qwen-pgc2
     claude-opus-4-8: deepseek-spark3
     claude-opus-4-7: deepseek-spark5
 
