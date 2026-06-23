@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -23,6 +24,9 @@ GUARD_SECTIONS = 2
 ASSISTANT_PLACEHOLDER = "."
 STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
 RAW_THINK_PREVIEW_LIMIT = 200
+MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
+DISABLE_HIDDEN_THINKING_MODEL_MARKERS = ("qwen-pgc2", "claude-sonnet-4-5-20250929")
+QWEN_NO_THINK_MARKER = "/no_think"
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -181,6 +185,54 @@ def _stop_after_first_native_tool(request_data: Optional[dict]) -> bool:
     return any(STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER in name.lower() for name in _request_model_names(request_data))
 
 
+def _should_disable_hidden_thinking(data: dict) -> bool:
+    model = str(data.get("model") or "").lower()
+    return any(marker in model for marker in DISABLE_HIDDEN_THINKING_MODEL_MARKERS)
+
+
+def _disable_hidden_thinking(data: dict) -> None:
+    removed: List[str] = []
+    for key in ("thinking", "output_config"):
+        if key in data:
+            data.pop(key, None)
+            removed.append(key)
+    _inject_qwen_no_think_controls(data)
+    if removed:
+        log.info(
+            "disabled hidden thinking controls for model=%s removed=%s",
+            data.get("model"),
+            ",".join(removed),
+        )
+
+
+def _inject_qwen_no_think_controls(data: dict) -> None:
+    system = data.get("system")
+    if isinstance(system, str):
+        if QWEN_NO_THINK_MARKER not in system.lower():
+            data["system"] = system.rstrip() + "\n\n" + QWEN_NO_THINK_MARKER
+    elif isinstance(system, list):
+        has_marker = any(
+            isinstance(block, dict)
+            and isinstance(block.get("text"), str)
+            and QWEN_NO_THINK_MARKER in block["text"].lower()
+            for block in system
+        )
+        if not has_marker:
+            system.append({"type": "text", "text": QWEN_NO_THINK_MARKER})
+    else:
+        data["system"] = QWEN_NO_THINK_MARKER
+
+    extra_body = data.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    chat_template_kwargs = extra_body.get("chat_template_kwargs")
+    if not isinstance(chat_template_kwargs, dict):
+        chat_template_kwargs = {}
+    chat_template_kwargs["enable_thinking"] = False
+    extra_body["chat_template_kwargs"] = chat_template_kwargs
+    data["extra_body"] = extra_body
+
+
 def convert_non_streaming_response(response: Any) -> Any:
     if isinstance(response, dict) and isinstance(response.get("content"), list):
         return _convert_anthropic_message_response(response)
@@ -322,6 +374,35 @@ def _sse(event_name: str, payload: Dict[str, Any], original: Any) -> Any:
     text = "event: " + event_name + "\n"
     text += "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
     return _encode_like(text, original)
+
+
+def _sse_comment(text: str, original: Any) -> Any:
+    return _encode_like(": " + text + "\n\n", original)
+
+
+async def _iter_with_keepalive(response: Any) -> AsyncGenerator[Any, None]:
+    iterator = response.__aiter__()
+    next_chunk = asyncio.create_task(iterator.__anext__())
+    original_for_output: Any = b""
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({next_chunk}, timeout=MESSAGES_STREAM_KEEPALIVE_SECONDS)
+            if not done:
+                yield _sse_comment("opencode-compat keepalive", original_for_output)
+                continue
+
+            try:
+                chunk = next_chunk.result()
+            except StopAsyncIteration:
+                break
+
+            original_for_output = chunk
+            next_chunk = asyncio.create_task(iterator.__anext__())
+            yield chunk
+    finally:
+        if not next_chunk.done():
+            next_chunk.cancel()
 
 
 def _is_complete_json_object(text: str) -> bool:
@@ -599,6 +680,9 @@ class OpencodeCompatHandler(CustomLogger):
         if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
             return data
 
+        if call_type == "anthropic_messages" and _should_disable_hidden_thinking(data):
+            _disable_hidden_thinking(data)
+
         _normalize_assistant_messages(data.get("messages"))
         return data
 
@@ -749,7 +833,7 @@ class OpencodeCompatHandler(CustomLogger):
         passthrough_blocked = False
         original_for_output: Any = b""
 
-        async for chunk in response:
+        async for chunk in _iter_with_keepalive(response):
             original_for_output = chunk
             chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
             sse_buffer += chunk_text
