@@ -648,6 +648,22 @@ def _messages_tool_use_events(tool_calls: Iterable[Dict[str, Any]], start_index:
     return events
 
 
+def _messages_end_turn_events(index: int, original: Any) -> List[Any]:
+    return [
+        _sse("content_block_stop", {"type": "content_block_stop", "index": index}, original),
+        _sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            },
+            original,
+        ),
+        _sse("message_stop", {"type": "message_stop"}, original),
+    ]
+
+
 class OpencodeCompatHandler(CustomLogger):
     """Compatibility layer for opencode raw DSML/Qwen tool-call output."""
 
@@ -769,6 +785,7 @@ class OpencodeCompatHandler(CustomLogger):
                     thinking_state = 2
                 chunk_text += raw_chunk_text
 
+            previous_buffer_len = len(buffer)
             buffer += chunk_text
             content_collected = True
 
@@ -787,8 +804,7 @@ class OpencodeCompatHandler(CustomLogger):
                     for out_chunk in build_stream_tool_call_chunks(parsed, last_id, last_model, last_created):
                         yield out_chunk
                 else:
-                    log.warning("stream raw tool block detected but parse returned empty")
-                    yield _make_content_chunk(last_id, last_model, last_created, buffer[idx:])
+                    log.warning("suppressing unparsable stream raw tool block: %s", buffer[idx:idx + 800])
                     yield _make_stream_chunk(last_id, last_model, last_created, {"content": ""}, finish_reason="stop")
                 return
 
@@ -803,6 +819,9 @@ class OpencodeCompatHandler(CustomLogger):
                 if unflushed_text:
                     yield _make_content_chunk(last_id, last_model, last_created, unflushed_text)
                     unflushed_text = ""
+                idx = find_raw_tool_start(buffer)
+                if idx > previous_buffer_len:
+                    yield _make_content_chunk(last_id, last_model, last_created, buffer[previous_buffer_len:idx])
                 continue
 
             unflushed_text += chunk_text
@@ -821,7 +840,7 @@ class OpencodeCompatHandler(CustomLogger):
                 if idx > 0:
                     yield _make_content_chunk(last_id, last_model, last_created, buffer[:idx])
                 if not has_complete_raw_tool_block(buffer) and idx < len(buffer):
-                    yield _make_content_chunk(last_id, last_model, last_created, buffer[idx:])
+                    log.warning("suppressing incomplete stream raw tool block: %s", buffer[idx:idx + 800])
         else:
             for item in pending:
                 yield _make_content_chunk(last_id, last_model, last_created, item)
@@ -851,6 +870,7 @@ class OpencodeCompatHandler(CustomLogger):
         open_content_blocks: set[int] = set()
         saw_message_stop = False
         saw_stop_message_delta = False
+        synthetic_stop_sent = False
 
         async for chunk in _iter_with_keepalive(response, request_context):
             original_for_output = chunk
@@ -895,6 +915,7 @@ class OpencodeCompatHandler(CustomLogger):
                                 dsml_mode = item["dsml_mode"]
                                 raw_think = item["raw_think"]
                                 passthrough_blocked = item["passthrough_blocked"]
+                                synthetic_stop_sent = synthetic_stop_sent or bool(item.get("stop_sent"))
                             else:
                                 yield item
                         continue
@@ -997,7 +1018,11 @@ class OpencodeCompatHandler(CustomLogger):
             if idx > 0:
                 yield _messages_text_delta(text_buffer[:idx], text_block_index, original_for_output, text_delta_type)
             if idx < len(text_buffer):
-                yield _messages_text_delta(text_buffer[idx:], text_block_index, original_for_output, text_delta_type)
+                log.warning(
+                    "suppressing incomplete messages raw tool block context=%s preview=%r",
+                    request_context,
+                    text_buffer[idx:idx + 800].replace("\n", "\\n"),
+                )
         else:
             tail = _flush_raw_think_tail(raw_think)
             if tail:
@@ -1012,7 +1037,7 @@ class OpencodeCompatHandler(CustomLogger):
         if sse_buffer and not passthrough_blocked:
             yield _encode_like(sse_buffer, original_for_output)
 
-        if not passthrough_blocked and not saw_message_stop:
+        if not saw_message_stop and not synthetic_stop_sent:
             for index in sorted(open_content_blocks):
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, original_for_output)
             if not saw_stop_message_delta:
@@ -1067,6 +1092,7 @@ class OpencodeCompatHandler(CustomLogger):
         raw_think["_revealed_delta"] = False
         safe_text = _strip_raw_think_delta(text, raw_think)
         revealed_hidden_delta = bool(raw_think.pop("_revealed_delta", False))
+        previous_text_len = len(text_buffer)
         text_buffer += safe_text
 
         if not revealed_hidden_delta and has_complete_raw_tool_block(text_buffer):
@@ -1087,18 +1113,25 @@ class OpencodeCompatHandler(CustomLogger):
                     "dsml_mode": True,
                     "raw_think": raw_think,
                     "passthrough_blocked": True,
+                    "stop_sent": True,
                 }
                 return
 
-            yield _messages_text_delta(text_buffer[idx:], text_block_index, original, delta_type)
+            log.warning(
+                "suppressing unparsable messages raw tool block preview=%r",
+                text_buffer[idx:idx + 800].replace("\n", "\\n"),
+            )
+            for event in _messages_end_turn_events(text_block_index, original):
+                yield event
             yield {
                 "_state": True,
                 "text_buffer": "",
                 "unflushed_text": "",
                 "pending": [],
-                "dsml_mode": False,
+                "dsml_mode": True,
                 "raw_think": raw_think,
-                "passthrough_blocked": False,
+                "passthrough_blocked": True,
+                "stop_sent": True,
             }
             return
 
@@ -1124,6 +1157,8 @@ class OpencodeCompatHandler(CustomLogger):
                 yield _messages_text_delta(unflushed_text, text_block_index, original, delta_type)
                 unflushed_text = ""
             idx = find_raw_tool_start(text_buffer)
+            if idx > previous_text_len:
+                yield _messages_text_delta(text_buffer[previous_text_len:idx], text_block_index, original, delta_type)
             if idx < len(text_buffer):
                 text_buffer = text_buffer[idx:]
             yield {

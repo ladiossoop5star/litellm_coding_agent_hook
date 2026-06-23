@@ -81,15 +81,16 @@ def has_any_dsml_prefix(text: str) -> bool:
     if not text:
         return False
     text = _normalize_dsml_bars(text)
+    for marker in (DSML_OPEN, "<DSML>tool_calls>", "<DSML:", "<tool_calls", "<tool_call"):
+        if marker in text:
+            return True
+
     tail = text[-150:] if len(text) > 150 else text
-    if DSML_OPEN[:8] in tail:
-        return True
-    if "<DSML>" in tail or "<DSML:" in tail:
-        return True
-    if "<tool_calls" in tail:
-        return True
-    if "<tool_call" in tail:
-        return True
+    for marker in (DSML_OPEN, "<DSML>tool_calls>", "<tool_calls>", "<tool_call>"):
+        max_size = min(len(tail), len(marker) - 1)
+        for size in range(max_size, 2, -1):
+            if marker.startswith(tail[-size:]):
+                return True
     return False
 
 
