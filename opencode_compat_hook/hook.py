@@ -25,6 +25,7 @@ ASSISTANT_PLACEHOLDER = "."
 STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
 RAW_THINK_PREVIEW_LIMIT = 200
 MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
+MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 
 
@@ -331,15 +332,24 @@ def _sse_comment(text: str, original: Any) -> Any:
     return _encode_like(": " + text + "\n\n", original)
 
 
-async def _iter_with_keepalive(response: Any) -> AsyncGenerator[Any, None]:
+async def _iter_with_keepalive(response: Any, request_context: str = "unknown-request") -> AsyncGenerator[Any, None]:
     iterator = response.__aiter__()
     next_chunk = asyncio.create_task(iterator.__anext__())
     original_for_output: Any = b""
+    last_chunk_at = time.time()
 
     try:
         while True:
             done, _ = await asyncio.wait({next_chunk}, timeout=MESSAGES_STREAM_KEEPALIVE_SECONDS)
             if not done:
+                idle_seconds = time.time() - last_chunk_at
+                if idle_seconds >= MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS:
+                    log.warning(
+                        "messages stream idle timeout after %.1fs context=%s",
+                        idle_seconds,
+                        request_context,
+                    )
+                    break
                 yield _sse_comment("opencode-compat keepalive", original_for_output)
                 continue
 
@@ -349,6 +359,7 @@ async def _iter_with_keepalive(response: Any) -> AsyncGenerator[Any, None]:
                 break
 
             original_for_output = chunk
+            last_chunk_at = time.time()
             next_chunk = asyncio.create_task(iterator.__anext__())
             yield chunk
     finally:
@@ -837,8 +848,11 @@ class OpencodeCompatHandler(CustomLogger):
         native_tool_json = ""
         passthrough_blocked = False
         original_for_output: Any = b""
+        open_content_blocks: set[int] = set()
+        saw_message_stop = False
+        saw_stop_message_delta = False
 
-        async for chunk in _iter_with_keepalive(response):
+        async for chunk in _iter_with_keepalive(response, request_context):
             original_for_output = chunk
             chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
             sse_buffer += chunk_text
@@ -898,10 +912,14 @@ class OpencodeCompatHandler(CustomLogger):
 
                 if event_name == "content_block_start":
                     text_block_index = int(payload.get("index", text_block_index) or 0)
+                    open_content_blocks.add(text_block_index)
                     content_block = payload.get("content_block") or {}
                     if content_block.get("type") == "tool_use" and native_tool_index is None:
                         native_tool_index = text_block_index
-                elif event_name in {"content_block_stop", "message_delta", "message_stop"}:
+                elif event_name == "content_block_stop":
+                    open_content_blocks.discard(int(payload.get("index", text_block_index) or text_block_index))
+
+                if event_name in {"content_block_stop", "message_delta", "message_stop"}:
                     tail = _flush_raw_think_tail(raw_think)
                     if tail:
                         unflushed_text += tail
@@ -911,6 +929,8 @@ class OpencodeCompatHandler(CustomLogger):
                     if event_name == "message_delta":
                         delta = payload.get("delta") or {}
                         stop_reason = delta.get("stop_reason")
+                        if stop_reason:
+                            saw_stop_message_delta = True
                         if stop_reason == "end_turn":
                             _raise_empty_unclosed_raw_think(
                                 raw_think,
@@ -923,6 +943,8 @@ class OpencodeCompatHandler(CustomLogger):
                             _warn_unclosed_raw_think(raw_think, request_context)
                     elif event_name == "message_stop" and raw_think.get("in_think"):
                         _warn_unclosed_raw_think(raw_think, request_context)
+                    if event_name == "message_stop":
+                        saw_message_stop = True
                     for item in pending:
                         yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
                     pending = []
@@ -989,6 +1011,22 @@ class OpencodeCompatHandler(CustomLogger):
 
         if sse_buffer and not passthrough_blocked:
             yield _encode_like(sse_buffer, original_for_output)
+
+        if not passthrough_blocked and not saw_message_stop:
+            for index in sorted(open_content_blocks):
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, original_for_output)
+            if not saw_stop_message_delta:
+                yield _sse(
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": 0},
+                    },
+                    original_for_output,
+                )
+            yield _sse("message_stop", {"type": "message_stop"}, original_for_output)
+            log.warning("synthesized missing messages stream stop context=%s", request_context)
 
     async def _handle_messages_text_delta(
         self,
