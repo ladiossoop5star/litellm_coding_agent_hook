@@ -25,8 +25,7 @@ ASSISTANT_PLACEHOLDER = "."
 STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
 RAW_THINK_PREVIEW_LIMIT = 200
 MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
-DISABLE_HIDDEN_THINKING_MODEL_MARKERS = ("qwen-pgc2", "claude-sonnet-4-5-20250929")
-QWEN_NO_THINK_MARKER = "/no_think"
+REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -183,54 +182,6 @@ def _request_model_names(request_data: Optional[dict]) -> set[str]:
 
 def _stop_after_first_native_tool(request_data: Optional[dict]) -> bool:
     return any(STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER in name.lower() for name in _request_model_names(request_data))
-
-
-def _should_disable_hidden_thinking(data: dict) -> bool:
-    model = str(data.get("model") or "").lower()
-    return any(marker in model for marker in DISABLE_HIDDEN_THINKING_MODEL_MARKERS)
-
-
-def _disable_hidden_thinking(data: dict) -> None:
-    removed: List[str] = []
-    for key in ("thinking", "output_config"):
-        if key in data:
-            data.pop(key, None)
-            removed.append(key)
-    _inject_qwen_no_think_controls(data)
-    if removed:
-        log.info(
-            "disabled hidden thinking controls for model=%s removed=%s",
-            data.get("model"),
-            ",".join(removed),
-        )
-
-
-def _inject_qwen_no_think_controls(data: dict) -> None:
-    system = data.get("system")
-    if isinstance(system, str):
-        if QWEN_NO_THINK_MARKER not in system.lower():
-            data["system"] = system.rstrip() + "\n\n" + QWEN_NO_THINK_MARKER
-    elif isinstance(system, list):
-        has_marker = any(
-            isinstance(block, dict)
-            and isinstance(block.get("text"), str)
-            and QWEN_NO_THINK_MARKER in block["text"].lower()
-            for block in system
-        )
-        if not has_marker:
-            system.append({"type": "text", "text": QWEN_NO_THINK_MARKER})
-    else:
-        data["system"] = QWEN_NO_THINK_MARKER
-
-    extra_body = data.get("extra_body")
-    if not isinstance(extra_body, dict):
-        extra_body = {}
-    chat_template_kwargs = extra_body.get("chat_template_kwargs")
-    if not isinstance(chat_template_kwargs, dict):
-        chat_template_kwargs = {}
-    chat_template_kwargs["enable_thinking"] = False
-    extra_body["chat_template_kwargs"] = chat_template_kwargs
-    data["extra_body"] = extra_body
 
 
 def convert_non_streaming_response(response: Any) -> Any:
@@ -432,6 +383,8 @@ def _raw_think_state() -> Dict[str, Any]:
         "visible_chars": 0,
         "warned_unclosed": False,
         "placeholder_emitted": False,
+        "revealing": False,
+        "reveal_prefix_emitted": False,
     }
 
 
@@ -448,6 +401,51 @@ def _record_raw_think_suppressed(text: str, state: Dict[str, Any]) -> None:
     if len(preview) < RAW_THINK_PREVIEW_LIMIT:
         remaining = RAW_THINK_PREVIEW_LIMIT - len(preview)
         state["preview"] = preview + text[:remaining]
+
+
+def _should_reveal_hidden_thinking(state: Dict[str, Any]) -> bool:
+    if state.get("revealing"):
+        return True
+    started_at = state.get("started_at")
+    if not isinstance(started_at, (int, float)):
+        return False
+    if time.time() - started_at < REVEAL_HIDDEN_THINKING_AFTER_SECONDS:
+        return False
+    state["revealing"] = True
+    log.warning(
+        "revealing hidden thinking after %.1fs chars=%s chunks=%s preview=%r",
+        time.time() - started_at,
+        state.get("suppressed_chars") or 0,
+        state.get("suppressed_chunks") or 0,
+        str(state.get("preview") or "").replace("\n", "\\n"),
+    )
+    return True
+
+
+def _hidden_thinking_reveal_prefix(state: Dict[str, Any]) -> str:
+    if state.get("reveal_prefix_emitted"):
+        return ""
+    state["reveal_prefix_emitted"] = True
+    preview = str(state.get("preview") or "")
+    if not preview:
+        return ""
+    omitted = int(state.get("suppressed_chars") or 0) - len(preview)
+    if omitted > 0:
+        return preview + "\n...\n"
+    return preview
+
+
+def _hidden_thinking_final_fallback(
+    state: Dict[str, Any], pending: Iterable[str], unflushed_text: str
+) -> str:
+    if _raw_think_has_visible_output(state, pending, unflushed_text):
+        return ""
+    if int(state.get("suppressed_chars") or 0) <= 0:
+        return ""
+    state["revealing"] = True
+    fallback = _hidden_thinking_reveal_prefix(state)
+    state["visible_chars"] = int(state.get("visible_chars") or 0) + len(fallback)
+    return fallback
 
 
 def _request_context(request_data: Optional[dict]) -> str:
@@ -545,15 +543,25 @@ def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
             close_idx = data.find(close_marker)
             if close_idx == -1:
                 tail = _matching_prefix_suffix(data, close_marker)
-                if tail:
-                    _record_raw_think_suppressed(data[:-len(tail)], state)
+                hidden_segment = data[:-len(tail)] if tail else data
+                if _should_reveal_hidden_thinking(state):
+                    state["_revealed_delta"] = True
+                    output.append(_hidden_thinking_reveal_prefix(state))
+                    output.append(hidden_segment)
                 else:
-                    _record_raw_think_suppressed(data, state)
-                state["tail"] = tail
+                    _record_raw_think_suppressed(hidden_segment, state)
+                if tail:
+                    state["tail"] = tail
                 visible = "".join(output)
                 state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
                 return visible
-            _record_raw_think_suppressed(data[:close_idx], state)
+            hidden_segment = data[:close_idx]
+            if _should_reveal_hidden_thinking(state):
+                state["_revealed_delta"] = True
+                output.append(_hidden_thinking_reveal_prefix(state))
+                output.append(hidden_segment)
+            else:
+                _record_raw_think_suppressed(hidden_segment, state)
             data = data[close_idx + len(close_marker):]
             state["in_think"] = False
             continue
@@ -679,9 +687,6 @@ class OpencodeCompatHandler(CustomLogger):
 
         if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
             return data
-
-        if call_type == "anthropic_messages" and _should_disable_hidden_thinking(data):
-            _disable_hidden_thinking(data)
 
         _normalize_assistant_messages(data.get("messages"))
         return data
@@ -900,6 +905,9 @@ class OpencodeCompatHandler(CustomLogger):
                     tail = _flush_raw_think_tail(raw_think)
                     if tail:
                         unflushed_text += tail
+                    fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+                    if fallback:
+                        yield _messages_text_delta(fallback, text_block_index, chunk, "text_delta")
                     if event_name == "message_delta":
                         delta = payload.get("delta") or {}
                         stop_reason = delta.get("stop_reason")
@@ -990,14 +998,40 @@ class OpencodeCompatHandler(CustomLogger):
         delta_type: str,
         state: Dict[str, Any],
     ) -> AsyncGenerator[Any, None]:
-        text_buffer = state["text_buffer"] + text
+        text_buffer = state["text_buffer"]
         unflushed_text = state["unflushed_text"]
         pending: List[str] = state["pending"]
         dsml_mode = state["dsml_mode"]
         raw_think = state["raw_think"]
         passthrough_blocked = False
 
-        if has_complete_raw_tool_block(text_buffer):
+        if delta_type == "thinking_delta":
+            if raw_think.get("started_at") is None:
+                raw_think["started_at"] = time.time()
+            if _should_reveal_hidden_thinking(raw_think):
+                visible_text = _hidden_thinking_reveal_prefix(raw_think) + text
+                raw_think["visible_chars"] = int(raw_think.get("visible_chars") or 0) + len(visible_text)
+                yield _messages_text_delta(visible_text, text_block_index, original, "text_delta")
+            else:
+                _record_raw_think_suppressed(text, raw_think)
+                yield _messages_text_delta(text, text_block_index, original, "thinking_delta")
+            yield {
+                "_state": True,
+                "text_buffer": text_buffer,
+                "unflushed_text": unflushed_text,
+                "pending": pending,
+                "dsml_mode": dsml_mode,
+                "raw_think": raw_think,
+                "passthrough_blocked": passthrough_blocked,
+            }
+            return
+
+        raw_think["_revealed_delta"] = False
+        safe_text = _strip_raw_think_delta(text, raw_think)
+        revealed_hidden_delta = bool(raw_think.pop("_revealed_delta", False))
+        text_buffer += safe_text
+
+        if not revealed_hidden_delta and has_complete_raw_tool_block(text_buffer):
             idx = find_raw_tool_start(text_buffer)
             if idx > 0 and not dsml_mode:
                 yield _messages_text_delta(text_buffer[:idx], text_block_index, original, delta_type)
@@ -1030,8 +1064,6 @@ class OpencodeCompatHandler(CustomLogger):
             }
             return
 
-        safe_text = _strip_raw_think_delta(text, raw_think)
-
         if dsml_mode:
             yield {
                 "_state": True,
@@ -1044,7 +1076,7 @@ class OpencodeCompatHandler(CustomLogger):
             }
             return
 
-        if has_any_dsml_prefix(text_buffer):
+        if not revealed_hidden_delta and has_any_dsml_prefix(text_buffer):
             dsml_mode = True
             passthrough_blocked = True
             for item in pending:
