@@ -162,7 +162,7 @@ def _should_skip_stream_conversion(request_data: Optional[dict]) -> bool:
         return False
 
     call_type = str(request_data.get("call_type") or "")
-    if call_type == "pass_through_endpoint":
+    if call_type in {"pass_through_endpoint", "responses", "aresponses"}:
         return True
 
     return False
@@ -297,6 +297,68 @@ def _normalize_assistant_messages(messages: Any) -> None:
 
         if not content and not msg.get("tool_calls"):
             msg["content"] = ASSISTANT_PLACEHOLDER
+
+
+def _chat_function_tool_from_responses_tool(tool: Dict[str, Any]) -> Dict[str, Any]:
+    parameters = tool.get("parameters") or {}
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object"}
+    if "type" not in parameters:
+        parameters = {**parameters, "type": "object"}
+    return {
+        "type": "function",
+        "function": {
+            "name": str(tool.get("name") or ""),
+            "description": str(tool.get("description") or ""),
+            "parameters": parameters,
+            "strict": bool(tool.get("strict", False)),
+        },
+    }
+
+
+def _sanitize_response_tools_for_litellm(tools: Any) -> Any:
+    if not isinstance(tools, list):
+        return tools
+    return [tool for tool in tools if isinstance(tool, dict) and tool.get("type") == "function"]
+
+
+def _sanitize_chat_tools_for_upstream(tools: Any) -> Any:
+    if not isinstance(tools, list):
+        return tools
+
+    sanitized = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        if isinstance(tool.get("function"), dict):
+            sanitized.append(tool)
+            continue
+        if tool.get("name"):
+            sanitized.append(_chat_function_tool_from_responses_tool(tool))
+    return sanitized
+
+
+def _sanitize_request_tools(data: dict, call_type: str) -> None:
+    if not isinstance(data, dict):
+        return
+
+    if isinstance(data.get("tools"), list):
+        if call_type in ("responses", "aresponses"):
+            data["tools"] = _sanitize_response_tools_for_litellm(data["tools"])
+        elif call_type in ("completion", "acompletion", "chat_completion"):
+            data["tools"] = _sanitize_chat_tools_for_upstream(data["tools"])
+        if isinstance(data.get("tools"), list) and not data["tools"]:
+            data.pop("tools", None)
+
+    optional_params = data.get("optional_params")
+    if (
+        call_type in ("responses", "aresponses", "completion", "acompletion", "chat_completion")
+        and isinstance(optional_params, dict)
+        and isinstance(optional_params.get("tools"), list)
+    ):
+        optional_params["tools"] = _sanitize_chat_tools_for_upstream(optional_params["tools"])
+        if not optional_params["tools"]:
+            optional_params.pop("tools", None)
 
 
 def _encode_like(text: str, original: Any) -> Any:
@@ -705,12 +767,7 @@ class OpencodeCompatHandler(CustomLogger):
             log.warning("failed to register /v1/responses/input_tokens route: %s", exc)
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
-        if call_type in ("completion", "acompletion", "chat_completion"):
-            tools = data.get("tools")
-            if isinstance(tools, list):
-                data["tools"] = [tool for tool in tools if isinstance(tool, dict) and tool.get("type") == "function"]
-                if not data["tools"]:
-                    data.pop("tools", None)
+        _sanitize_request_tools(data, call_type)
 
         if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
             return data
@@ -743,6 +800,7 @@ class OpencodeCompatHandler(CustomLogger):
         pending: List[str] = []
         dsml_mode = False
         content_collected = False
+        raw_stream_passthrough = False
         thinking_state = 0
         last_id = "chatcmpl-opencode-compat"
         last_model = request_data.get("model", "unknown") if request_data else "unknown"
@@ -751,6 +809,24 @@ class OpencodeCompatHandler(CustomLogger):
         async for chunk in response:
             # Native passthrough streams can be bytes; leave them untouched.
             if isinstance(chunk, (bytes, bytearray)):
+                raw_stream_passthrough = True
+                yield chunk
+                continue
+
+            if isinstance(chunk, str) and (chunk.startswith("data:") or chunk.startswith("event:")):
+                raw_stream_passthrough = True
+                yield chunk
+                continue
+
+            event_type = _get(chunk, "type", None)
+            if isinstance(event_type, str) and event_type.startswith("response."):
+                raw_stream_passthrough = True
+                yield chunk
+                continue
+
+            chunk_as_text = str(chunk)
+            if chunk_as_text.startswith("data:") or chunk_as_text.startswith("event:"):
+                raw_stream_passthrough = True
                 yield chunk
                 continue
 
@@ -846,6 +922,9 @@ class OpencodeCompatHandler(CustomLogger):
                 yield _make_content_chunk(last_id, last_model, last_created, item)
             if unflushed_text:
                 yield _make_content_chunk(last_id, last_model, last_created, unflushed_text)
+
+        if raw_stream_passthrough and not content_collected:
+            return
 
         yield _make_stream_chunk(last_id, last_model, last_created, {"content": ""}, finish_reason="stop")
 
