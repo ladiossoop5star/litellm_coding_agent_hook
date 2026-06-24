@@ -1068,13 +1068,14 @@ class OpencodeCompatHandler(CustomLogger):
         raw_think = state["raw_think"]
         passthrough_blocked = False
 
+        probe_buffer = text_buffer + text
+        should_parse_tool = (
+            dsml_mode
+            or has_complete_raw_tool_block(probe_buffer)
+            or has_any_dsml_prefix(probe_buffer)
+        )
+
         if delta_type == "thinking_delta":
-            probe_buffer = text_buffer + text
-            should_parse_tool = (
-                dsml_mode
-                or has_complete_raw_tool_block(probe_buffer)
-                or has_any_dsml_prefix(probe_buffer)
-            )
             if not should_parse_tool:
                 if raw_think.get("started_at") is None:
                     raw_think["started_at"] = time.time()
@@ -1097,7 +1098,7 @@ class OpencodeCompatHandler(CustomLogger):
                 return
 
         raw_think["_revealed_delta"] = False
-        if delta_type == "thinking_delta":
+        if should_parse_tool:
             safe_text = text
             revealed_hidden_delta = False
         else:
