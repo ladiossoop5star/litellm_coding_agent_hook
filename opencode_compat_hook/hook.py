@@ -27,6 +27,7 @@ RAW_THINK_PREVIEW_LIMIT = 200
 MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
 MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
+_RESPONSES_EMPTY_TOOLS_PATCHED = False
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -182,6 +183,8 @@ def _request_model_names(request_data: Optional[dict]) -> set[str]:
 
 
 def _stop_after_first_native_tool(request_data: Optional[dict]) -> bool:
+    if _is_messages_stream(request_data):
+        return True
     return any(STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER in name.lower() for name in _request_model_names(request_data))
 
 
@@ -342,13 +345,17 @@ def _sanitize_request_tools(data: dict, call_type: str) -> None:
     if not isinstance(data, dict):
         return
 
+    if call_type in ("responses", "aresponses") and _is_codex_compaction_request(data):
+        _disable_tools_for_compaction(data)
+        return
+
     if isinstance(data.get("tools"), list):
         if call_type in ("responses", "aresponses"):
             data["tools"] = _sanitize_response_tools_for_litellm(data["tools"])
         elif call_type in ("completion", "acompletion", "chat_completion"):
             data["tools"] = _sanitize_chat_tools_for_upstream(data["tools"])
         if isinstance(data.get("tools"), list) and not data["tools"]:
-            data.pop("tools", None)
+            _drop_empty_tools(data)
 
     optional_params = data.get("optional_params")
     if (
@@ -358,7 +365,133 @@ def _sanitize_request_tools(data: dict, call_type: str) -> None:
     ):
         optional_params["tools"] = _sanitize_chat_tools_for_upstream(optional_params["tools"])
         if not optional_params["tools"]:
-            optional_params.pop("tools", None)
+            _drop_empty_tools(optional_params)
+
+
+def _drop_empty_tools(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    if isinstance(payload.get("tools"), list) and not payload["tools"]:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+
+
+def _disable_tools_for_compaction(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    payload.pop("tools", None)
+    payload.pop("tool_choice", None)
+    payload["parallel_tool_calls"] = False
+
+    optional_params = payload.get("optional_params")
+    if isinstance(optional_params, dict):
+        optional_params.pop("tools", None)
+        optional_params.pop("tool_choice", None)
+        optional_params["parallel_tool_calls"] = False
+
+
+def _metadata_dicts(payload: Any) -> Iterable[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+
+    dicts: List[Dict[str, Any]] = [payload]
+    for key in ("metadata", "client_metadata", "litellm_metadata"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            dicts.append(value)
+
+    extra_body = payload.get("extra_body")
+    if isinstance(extra_body, dict):
+        dicts.append(extra_body)
+        client_metadata = extra_body.get("client_metadata")
+        if isinstance(client_metadata, dict):
+            dicts.append(client_metadata)
+
+    return dicts
+
+
+def _codex_turn_metadata(payload: Any) -> Dict[str, Any]:
+    for metadata in _metadata_dicts(payload):
+        raw = metadata.get("x-codex-turn-metadata")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _iter_response_input_text(input_value: Any) -> Iterable[str]:
+    if isinstance(input_value, str):
+        yield input_value
+        return
+
+    if not isinstance(input_value, list):
+        return
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            yield content
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text") or part.get("input_text")
+            if isinstance(text, str):
+                yield text
+
+
+def _is_codex_compaction_request(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    turn_metadata = _codex_turn_metadata(payload)
+    if turn_metadata.get("request_kind") == "compaction":
+        return True
+    if isinstance(turn_metadata.get("compaction"), dict):
+        return True
+
+    marker = "CONTEXT CHECKPOINT COMPACTION"
+    return any(marker in text for text in _iter_response_input_text(payload.get("input")))
+
+
+def _patch_litellm_responses_empty_tools_bridge() -> None:
+    global _RESPONSES_EMPTY_TOOLS_PATCHED
+
+    if _RESPONSES_EMPTY_TOOLS_PATCHED:
+        return
+
+    try:
+        from litellm.responses.litellm_completion_transformation.transformation import (
+            LiteLLMCompletionResponsesConfig,
+        )
+
+        original = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request
+        if getattr(original, "_opencode_empty_tools_patched", False):
+            _RESPONSES_EMPTY_TOOLS_PATCHED = True
+            return
+
+        def patched_transform(*args: Any, **kwargs: Any) -> dict:
+            completion_request = original(*args, **kwargs)
+            _drop_empty_tools(completion_request)
+            return completion_request
+
+        setattr(patched_transform, "_opencode_empty_tools_patched", True)
+        LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request = staticmethod(
+            patched_transform
+        )
+        _RESPONSES_EMPTY_TOOLS_PATCHED = True
+        log.info("patched LiteLLM Responses bridge to omit empty tools")
+    except Exception as exc:
+        log.warning("failed to patch LiteLLM Responses empty-tools bridge: %s", exc)
 
 
 def _encode_like(text: str, original: Any) -> Any:
@@ -434,6 +567,51 @@ def _is_complete_json_object(text: str) -> bool:
         return isinstance(json.loads(text), dict)
     except Exception:
         return False
+
+
+def _event_index(payload: Dict[str, Any], default: int = 0) -> int:
+    value = payload.get("index", default)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _first_complete_openai_tool_call(
+    state: Dict[int, Dict[str, str]], delta: Any
+) -> Optional[Dict[str, Any]]:
+    tool_calls = _get(delta, "tool_calls", None)
+    if not tool_calls:
+        return None
+
+    for tool_call in tool_calls:
+        index = _get(tool_call, "index", 0) or 0
+        entry = state.setdefault(int(index), {"id": "", "name": "", "arguments": ""})
+        tool_id = _get(tool_call, "id", None)
+        if tool_id:
+            entry["id"] = str(tool_id)
+
+        function = _get(tool_call, "function", {}) or {}
+        name = _get(function, "name", None)
+        if name:
+            entry["name"] = str(name)
+        arguments = _get(function, "arguments", None)
+        if isinstance(arguments, str):
+            entry["arguments"] += arguments
+
+        if entry["name"] and _is_complete_json_object(entry["arguments"]):
+            return {
+                "id": entry["id"],
+                "type": "function",
+                "function": {
+                    "name": entry["name"],
+                    "arguments": entry["arguments"],
+                },
+            }
+
+    return None
 
 
 def _messages_text_delta(text: str, index: int, original: Any, delta_type: str = "text_delta") -> Any:
@@ -730,6 +908,7 @@ class OpencodeCompatHandler(CustomLogger):
     """Compatibility layer for opencode raw DSML/Qwen tool-call output."""
 
     def __init__(self) -> None:
+        _patch_litellm_responses_empty_tools_bridge()
         self._register_input_tokens_route()
 
     def _register_input_tokens_route(self) -> None:
@@ -774,6 +953,17 @@ class OpencodeCompatHandler(CustomLogger):
 
         _normalize_assistant_messages(data.get("messages"))
         return data
+
+    async def async_pre_request_hook(self, model: str, messages: List[Any], kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if _is_codex_compaction_request(kwargs):
+            _disable_tools_for_compaction(kwargs)
+            return kwargs
+
+        if isinstance(kwargs, dict) and isinstance(kwargs.get("tools"), list):
+            kwargs["tools"] = _sanitize_chat_tools_for_upstream(kwargs["tools"])
+            _drop_empty_tools(kwargs)
+            return kwargs
+        return None
 
     async def async_post_call_success_hook(self, data: dict, user_api_key_dict: Any, response: Any) -> Any:
         return convert_non_streaming_response(response)
@@ -947,12 +1137,25 @@ class OpencodeCompatHandler(CustomLogger):
         passthrough_blocked = False
         original_for_output: Any = b""
         open_content_blocks: set[int] = set()
+        saw_content_block = False
+        openai_tool_state: Dict[int, Dict[str, str]] = {}
         saw_message_stop = False
         saw_stop_message_delta = False
         synthetic_stop_sent = False
 
         async for chunk in _iter_with_keepalive(response, request_context):
             original_for_output = chunk
+            if stop_after_first_native_tool:
+                complete_openai_tool = _first_complete_openai_tool_call(openai_tool_state, _delta(chunk))
+                if complete_openai_tool:
+                    for index in sorted(open_content_blocks):
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
+                    tool_index = max(open_content_blocks | {text_block_index}) + 1 if saw_content_block else 0
+                    for event in _messages_tool_use_events([complete_openai_tool], tool_index, chunk):
+                        yield event
+                    log.info("synthesized messages native tool stop from OpenAI stream context=%s", request_context)
+                    return
+
             chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
             sse_buffer += chunk_text
 
@@ -972,7 +1175,7 @@ class OpencodeCompatHandler(CustomLogger):
                     delta_type = str(delta.get("type") or "")
                     delta_field = "thinking" if delta_type == "thinking_delta" else "text"
                     if delta_type in {"text_delta", "thinking_delta"} and isinstance(delta.get(delta_field), str):
-                        text_block_index = int(payload.get("index", text_block_index) or 0)
+                        text_block_index = _event_index(payload, text_block_index)
                         text_delta_type = delta_type
                         async for item in self._handle_messages_text_delta(
                             delta[delta_field],
@@ -1001,7 +1204,7 @@ class OpencodeCompatHandler(CustomLogger):
                     if (
                         stop_after_first_native_tool
                         and native_tool_index is not None
-                        and int(payload.get("index", -1) or -1) == native_tool_index
+                        and _event_index(payload, -1) == native_tool_index
                         and delta.get("type") == "input_json_delta"
                         and isinstance(delta.get("partial_json"), str)
                     ):
@@ -1011,13 +1214,14 @@ class OpencodeCompatHandler(CustomLogger):
                     continue
 
                 if event_name == "content_block_start":
-                    text_block_index = int(payload.get("index", text_block_index) or 0)
+                    saw_content_block = True
+                    text_block_index = _event_index(payload, text_block_index)
                     open_content_blocks.add(text_block_index)
                     content_block = payload.get("content_block") or {}
                     if content_block.get("type") == "tool_use" and native_tool_index is None:
                         native_tool_index = text_block_index
                 elif event_name == "content_block_stop":
-                    open_content_blocks.discard(int(payload.get("index", text_block_index) or text_block_index))
+                    open_content_blocks.discard(_event_index(payload, text_block_index))
 
                 if event_name in {"content_block_stop", "message_delta", "message_stop"}:
                     tail = _flush_raw_think_tail(raw_think)
@@ -1072,13 +1276,14 @@ class OpencodeCompatHandler(CustomLogger):
                         chunk,
                     )
                     yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                    log.info("synthesized messages native tool stop from Anthropic SSE context=%s", request_context)
                     return
 
                 if (
                     stop_after_first_native_tool
                     and native_tool_index is not None
                     and event_name == "content_block_stop"
-                    and int(payload.get("index", -1) or -1) == native_tool_index
+                    and _event_index(payload, -1) == native_tool_index
                 ):
                     yield _sse(
                         "message_delta",
