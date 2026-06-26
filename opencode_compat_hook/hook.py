@@ -449,6 +449,97 @@ def _iter_response_input_text(input_value: Any) -> Iterable[str]:
                 yield text
 
 
+def _strip_raw_think_from_history_text(text: str) -> str:
+    state = _raw_think_state()
+    visible = _strip_raw_think_delta(text, state)
+    visible += _flush_raw_think_tail(state)
+    if state.get("in_think"):
+        _warn_unclosed_raw_think(state, "responses-input-history")
+    return visible
+
+
+def _sanitize_response_input_history(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    input_value = payload.get("input")
+    if not isinstance(input_value, list):
+        return
+
+    removed_items = 0
+    stripped_parts = 0
+    sanitized_items: List[Any] = []
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            sanitized_items.append(item)
+            continue
+        if item.get("role") != "assistant" or item.get("type") not in (None, "message"):
+            sanitized_items.append(item)
+            continue
+
+        content = item.get("content")
+        if isinstance(content, str):
+            cleaned = _strip_raw_think_from_history_text(content)
+            if cleaned.strip():
+                new_item = dict(item)
+                new_item["content"] = cleaned
+                sanitized_items.append(new_item)
+            else:
+                removed_items += 1
+            if cleaned != content:
+                stripped_parts += 1
+            continue
+
+        if not isinstance(content, list):
+            sanitized_items.append(item)
+            continue
+
+        new_content: List[Any] = []
+        for part in content:
+            if not isinstance(part, dict):
+                new_content.append(part)
+                continue
+            part_type = part.get("type")
+            if part_type not in {"output_text", "text", "input_text"}:
+                new_content.append(part)
+                continue
+            text = part.get("text")
+            if not isinstance(text, str):
+                new_content.append(part)
+                continue
+            cleaned = _strip_raw_think_from_history_text(text)
+            if cleaned != text:
+                stripped_parts += 1
+            if cleaned.strip():
+                new_part = dict(part)
+                new_part["text"] = cleaned
+                new_content.append(new_part)
+
+        if new_content:
+            new_item = dict(item)
+            new_item["content"] = new_content
+            sanitized_items.append(new_item)
+        else:
+            removed_items += 1
+
+    if removed_items or stripped_parts:
+        payload["input"] = sanitized_items
+        log.warning(
+            "sanitized responses input raw <think> history removed_items=%s stripped_parts=%s",
+            removed_items,
+            stripped_parts,
+        )
+
+
+def _disable_responses_reasoning_merge(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    payload["merge_reasoning_content_in_choices"] = False
+    optional_params = payload.get("optional_params")
+    if isinstance(optional_params, dict):
+        optional_params["merge_reasoning_content_in_choices"] = False
+
+
 def _is_codex_compaction_request(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -947,6 +1038,9 @@ class OpencodeCompatHandler(CustomLogger):
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
         _sanitize_request_tools(data, call_type)
+        if call_type in ("responses", "aresponses"):
+            _disable_responses_reasoning_merge(data)
+            _sanitize_response_input_history(data)
 
         if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
             return data
