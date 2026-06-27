@@ -8,6 +8,21 @@
 # =========================================================================
 
 model_list:
+  - model_name: test-pgc1
+    litellm_params:
+      model: openai/ornith_35b
+      api_base: http://10.115.140.89:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 102400
+      max_input_tokens: 92160
+      max_output_tokens: 32768
+
   - model_name: qwen-pgc2
     litellm_params:
       model: openai/qwen3.6-27b-ud-q8-xl
