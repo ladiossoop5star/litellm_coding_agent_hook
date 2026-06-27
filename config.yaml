@@ -19,8 +19,8 @@ model_list:
 
       merge_reasoning_content_in_choices: true
     model_info:
-      max_tokens: 102400
-      max_input_tokens: 92160
+      max_tokens: 200000
+      max_input_tokens: 167232
       max_output_tokens: 32768
 
   - model_name: qwen-pgc2
