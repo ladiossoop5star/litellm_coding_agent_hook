@@ -540,6 +540,76 @@ def _disable_responses_reasoning_merge(payload: Any) -> None:
         optional_params["merge_reasoning_content_in_choices"] = False
 
 
+def _model_group_names_from_payload(payload: Any) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    metadata = payload.get("litellm_metadata") or {}
+    values = {
+        payload.get("model"),
+        metadata.get("model_group"),
+        metadata.get("deployment"),
+        metadata.get("deployment_model_name"),
+    }
+    return {str(value).lower() for value in values if value}
+
+
+def _valid_tool_arguments_json(arguments: Any) -> bool:
+    if not isinstance(arguments, str):
+        return False
+    try:
+        json.loads(arguments)
+        return True
+    except Exception:
+        return False
+
+
+def _response_function_call_ids(item: Dict[str, Any]) -> set[str]:
+    return {str(value) for value in (item.get("call_id"), item.get("id")) if value}
+
+
+def _sanitize_malformed_function_call_history(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    input_value = payload.get("input")
+    if not isinstance(input_value, list):
+        return
+
+    bad_call_ids: set[str] = set()
+    malformed_calls = 0
+    for item in input_value:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        if _valid_tool_arguments_json(item.get("arguments")):
+            continue
+        malformed_calls += 1
+        bad_call_ids.update(_response_function_call_ids(item))
+
+    if not malformed_calls:
+        return
+
+    removed_outputs = 0
+    sanitized_items: List[Any] = []
+    for item in input_value:
+        if not isinstance(item, dict):
+            sanitized_items.append(item)
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call" and _response_function_call_ids(item) & bad_call_ids:
+            continue
+        if item_type == "function_call_output" and str(item.get("call_id") or "") in bad_call_ids:
+            removed_outputs += 1
+            continue
+        sanitized_items.append(item)
+
+    payload["input"] = sanitized_items
+    log.warning(
+        "sanitized malformed responses function_call history model=%s calls=%s outputs=%s",
+        ",".join(sorted(_model_group_names_from_payload(payload))) or "unknown",
+        malformed_calls,
+        removed_outputs,
+    )
+
+
 def _is_codex_compaction_request(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -1041,6 +1111,7 @@ class OpencodeCompatHandler(CustomLogger):
         if call_type in ("responses", "aresponses"):
             _disable_responses_reasoning_merge(data)
             _sanitize_response_input_history(data)
+            _sanitize_malformed_function_call_history(data)
 
         if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
             return data
