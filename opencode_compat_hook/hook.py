@@ -486,9 +486,11 @@ def _strip_internal_artifacts_from_history_text(text: str) -> str:
     return cleaned
 
 
-def _sanitize_content_text_parts(content: Any) -> Tuple[Any, bool]:
+def _sanitize_content_text_parts(content: Any, strip_raw_think: bool = False) -> Tuple[Any, bool]:
     if isinstance(content, str):
         cleaned = _strip_internal_artifacts_from_history_text(content)
+        if strip_raw_think:
+            cleaned = _strip_raw_think_from_history_text(cleaned)
         return cleaned, cleaned != content
 
     if not isinstance(content, list):
@@ -511,6 +513,8 @@ def _sanitize_content_text_parts(content: Any) -> Tuple[Any, bool]:
             continue
 
         cleaned = _strip_internal_artifacts_from_history_text(part[text_key])
+        if strip_raw_think:
+            cleaned = _strip_raw_think_from_history_text(cleaned)
         if cleaned != part[text_key]:
             changed = True
             if not cleaned.strip():
@@ -540,16 +544,28 @@ def _sanitize_chat_internal_artifact_history(payload: Any) -> None:
             continue
 
         content = message.get("content")
-        cleaned_content, changed = _sanitize_content_text_parts(content)
+        strip_raw_think = message.get("role") == "assistant"
+        cleaned_content, changed = _sanitize_content_text_parts(content, strip_raw_think=strip_raw_think)
+        if message.get("role") == "assistant" and message.get("tool_calls") and cleaned_content:
+            cleaned_content = ""
+            changed = True
         if not changed:
             sanitized_messages.append(message)
             continue
 
         changed_parts += 1
-        if isinstance(cleaned_content, str) and not cleaned_content.strip():
+        if (
+            isinstance(cleaned_content, str)
+            and not cleaned_content.strip()
+            and not (message.get("role") == "assistant" and message.get("tool_calls"))
+        ):
             removed_messages += 1
             continue
-        if isinstance(cleaned_content, list) and not cleaned_content:
+        if (
+            isinstance(cleaned_content, list)
+            and not cleaned_content
+            and not (message.get("role") == "assistant" and message.get("tool_calls"))
+        ):
             removed_messages += 1
             continue
 
@@ -564,6 +580,95 @@ def _sanitize_chat_internal_artifact_history(payload: Any) -> None:
             removed_messages,
             changed_parts,
         )
+
+
+def _message_role(message: Any) -> str:
+    return str(message.get("role") or "") if isinstance(message, dict) else ""
+
+
+def _tool_calls_signature(message: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+    signature = []
+    for tool_call in message.get("tool_calls") or []:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function") or {}
+        if not isinstance(function, dict):
+            continue
+        signature.append((str(function.get("name") or ""), str(function.get("arguments") or "")))
+    return tuple(signature)
+
+
+def _tool_result_signature(messages: List[Any], start: int) -> Tuple[Tuple[str, str], ...]:
+    results = []
+    index = start
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or _message_role(message) != "tool":
+            break
+        content = message.get("content")
+        if isinstance(content, str):
+            content_sig = content
+        else:
+            content_sig = json.dumps(content, sort_keys=True, ensure_ascii=False, default=str)
+        results.append((str(message.get("name") or ""), content_sig))
+        index += 1
+    return tuple(results)
+
+
+def _assistant_tool_group(messages: List[Any], start: int) -> Optional[Tuple[Tuple[Any, ...], int]]:
+    message = messages[start]
+    if not isinstance(message, dict) or _message_role(message) != "assistant" or not message.get("tool_calls"):
+        return None
+
+    end = start + 1
+    while end < len(messages) and isinstance(messages[end], dict) and _message_role(messages[end]) == "tool":
+        end += 1
+
+    key = (_tool_calls_signature(message), _tool_result_signature(messages, start + 1))
+    if not key[0] or not key[1]:
+        return None
+    return key, end
+
+
+def _sanitize_repeated_chat_tool_history(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    output: List[Any] = []
+    dropped_groups = 0
+    index = 0
+    while index < len(messages):
+        group = _assistant_tool_group(messages, index)
+        if group is None:
+            output.append(messages[index])
+            index += 1
+            continue
+
+        key, group_end = group
+        run: List[Tuple[int, int]] = [(index, group_end)]
+        next_index = group_end
+        while next_index < len(messages):
+            next_group = _assistant_tool_group(messages, next_index)
+            if next_group is None or next_group[0] != key:
+                break
+            run.append((next_index, next_group[1]))
+            next_index = next_group[1]
+
+        if len(run) >= 3:
+            dropped_groups += len(run) - 1
+            keep_start, keep_end = run[-1]
+            output.extend(messages[keep_start:keep_end])
+        else:
+            for start, end in run:
+                output.extend(messages[start:end])
+        index = next_index
+
+    if dropped_groups:
+        payload["messages"] = output
+        log.warning("collapsed repeated chat tool history groups=%s", dropped_groups)
 
 
 def _sanitize_response_input_history(payload: Any) -> None:
@@ -1225,6 +1330,7 @@ class OpencodeCompatHandler(CustomLogger):
             return data
 
         _sanitize_chat_internal_artifact_history(data)
+        _sanitize_repeated_chat_tool_history(data)
         _normalize_assistant_messages(data.get("messages"))
         return data
 
