@@ -31,16 +31,24 @@ RAW_TOOL_FRAGMENT_MARKERS = RAW_TOOL_OPEN_MARKERS + (
     DSML_CLOSE,
     DSML_TAG_PREFIX + "invoke",
     DSML_TAG_PREFIX + "parameter",
+    DSML_TAG_PREFIX + "system-reminder",
     DSML_CLOSE_PREFIX + "invoke",
     DSML_CLOSE_PREFIX + "parameter",
     DSML_CLOSE_PREFIX + "tool_calls",
+    DSML_CLOSE_PREFIX + "system-reminder",
     "<DSML:",
     "</DSML:",
     "<|DSML|invoke",
     "<|DSML|parameter",
+    "<|DSML|system-reminder",
     "</|DSML|invoke",
     "</|DSML|parameter",
     "</|DSML|tool_calls",
+    "</|DSML|system-reminder",
+    "<dcp-system-reminder>",
+    "</dcp-system-reminder>",
+    "<dcp-message-id>",
+    "</dcp-message-id>",
     "</tool_calls>",
     "</tool_call>",
 )
@@ -58,8 +66,10 @@ def _normalize_dsml_bars(text: str) -> str:
         .replace(DSML_CLOSE_ALT, DSML_CLOSE)
         .replace(DSML_TAG_PREFIX_ALT + "invoke", DSML_TAG_PREFIX + "invoke")
         .replace(DSML_TAG_PREFIX_ALT + "parameter", DSML_TAG_PREFIX + "parameter")
+        .replace(DSML_TAG_PREFIX_ALT + "system-reminder", DSML_TAG_PREFIX + "system-reminder")
         .replace(DSML_CLOSE_PREFIX_ALT + "invoke", DSML_CLOSE_PREFIX + "invoke")
         .replace(DSML_CLOSE_PREFIX_ALT + "parameter", DSML_CLOSE_PREFIX + "parameter")
+        .replace(DSML_CLOSE_PREFIX_ALT + "system-reminder", DSML_CLOSE_PREFIX + "system-reminder")
     )
 
 

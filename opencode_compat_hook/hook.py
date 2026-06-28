@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Tuple
@@ -456,6 +457,113 @@ def _strip_raw_think_from_history_text(text: str) -> str:
     if state.get("in_think"):
         _warn_unclosed_raw_think(state, "responses-input-history")
     return visible
+
+
+_INTERNAL_ARTIFACT_BLOCK_PATTERNS = (
+    re.compile(
+        r"<dcp-system-reminder\b[^>]*>.*?(?:</dcp-system-reminder>|</\uff5cDSML\uff5csystem-reminder>|</\|DSML\|system-reminder>)",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<system-reminder\b[^>]*>.*?</system-reminder>",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<(?:\uff5cDSML\uff5c|\|DSML\|)system-reminder\b[^>]*>.*?</(?:\uff5cDSML\uff5c|\|DSML\|)system-reminder>",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<dcp-message-id\b[^>]*>.*?</dcp-message-id>",
+        re.DOTALL,
+    ),
+)
+
+
+def _strip_internal_artifacts_from_history_text(text: str) -> str:
+    cleaned = text
+    for pattern in _INTERNAL_ARTIFACT_BLOCK_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned
+
+
+def _sanitize_content_text_parts(content: Any) -> Tuple[Any, bool]:
+    if isinstance(content, str):
+        cleaned = _strip_internal_artifacts_from_history_text(content)
+        return cleaned, cleaned != content
+
+    if not isinstance(content, list):
+        return content, False
+
+    changed = False
+    new_content: List[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            new_content.append(part)
+            continue
+
+        text_key = None
+        for candidate in ("text", "input_text"):
+            if isinstance(part.get(candidate), str):
+                text_key = candidate
+                break
+        if text_key is None:
+            new_content.append(part)
+            continue
+
+        cleaned = _strip_internal_artifacts_from_history_text(part[text_key])
+        if cleaned != part[text_key]:
+            changed = True
+            if not cleaned.strip():
+                continue
+            new_part = dict(part)
+            new_part[text_key] = cleaned
+            new_content.append(new_part)
+        else:
+            new_content.append(part)
+
+    return new_content, changed
+
+
+def _sanitize_chat_internal_artifact_history(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    changed_parts = 0
+    removed_messages = 0
+    sanitized_messages: List[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            sanitized_messages.append(message)
+            continue
+
+        content = message.get("content")
+        cleaned_content, changed = _sanitize_content_text_parts(content)
+        if not changed:
+            sanitized_messages.append(message)
+            continue
+
+        changed_parts += 1
+        if isinstance(cleaned_content, str) and not cleaned_content.strip():
+            removed_messages += 1
+            continue
+        if isinstance(cleaned_content, list) and not cleaned_content:
+            removed_messages += 1
+            continue
+
+        new_message = dict(message)
+        new_message["content"] = cleaned_content
+        sanitized_messages.append(new_message)
+
+    if changed_parts or removed_messages:
+        payload["messages"] = sanitized_messages
+        log.warning(
+            "sanitized chat internal artifact history removed_messages=%s changed_parts=%s",
+            removed_messages,
+            changed_parts,
+        )
 
 
 def _sanitize_response_input_history(payload: Any) -> None:
@@ -1116,6 +1224,7 @@ class OpencodeCompatHandler(CustomLogger):
         if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
             return data
 
+        _sanitize_chat_internal_artifact_history(data)
         _normalize_assistant_messages(data.get("messages"))
         return data
 
