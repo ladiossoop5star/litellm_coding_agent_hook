@@ -13,10 +13,68 @@ DSML_OPEN = "<" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 DSML_CLOSE = "</" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 DSML_OPEN_ALT = "<|DSML|tool_calls>"
 DSML_CLOSE_ALT = "</|DSML|tool_calls>"
+DSML_TAG_PREFIX = "<" + DSML_BAR + "DSML" + DSML_BAR
+DSML_CLOSE_PREFIX = "</" + DSML_BAR + "DSML" + DSML_BAR
+DSML_TAG_PREFIX_ALT = "<|DSML|"
+DSML_CLOSE_PREFIX_ALT = "</|DSML|"
+
+RAW_TOOL_OPEN_MARKERS = (
+    DSML_OPEN,
+    "<DSML>tool_calls>",
+    "<tool_calls>",
+    "<tool_calls",
+    "<tool_call>",
+    "<tool_call",
+)
+
+RAW_TOOL_FRAGMENT_MARKERS = RAW_TOOL_OPEN_MARKERS + (
+    DSML_CLOSE,
+    DSML_TAG_PREFIX + "invoke",
+    DSML_TAG_PREFIX + "parameter",
+    DSML_CLOSE_PREFIX + "invoke",
+    DSML_CLOSE_PREFIX + "parameter",
+    DSML_CLOSE_PREFIX + "tool_calls",
+    "<DSML:",
+    "</DSML:",
+    "<|DSML|invoke",
+    "<|DSML|parameter",
+    "</|DSML|invoke",
+    "</|DSML|parameter",
+    "</|DSML|tool_calls",
+    "</tool_calls>",
+    "</tool_call>",
+)
+
+INTERNAL_LEAK_SENTINELS = (
+    "Active compressed blocks in this session:",
+    "If your selected compression range includes any listed block",
+    "required placeholder exactly once in the summary using",
+)
 
 
 def _normalize_dsml_bars(text: str) -> str:
-    return text.replace(DSML_OPEN_ALT, DSML_OPEN).replace(DSML_CLOSE_ALT, DSML_CLOSE)
+    return (
+        text.replace(DSML_OPEN_ALT, DSML_OPEN)
+        .replace(DSML_CLOSE_ALT, DSML_CLOSE)
+        .replace(DSML_TAG_PREFIX_ALT + "invoke", DSML_TAG_PREFIX + "invoke")
+        .replace(DSML_TAG_PREFIX_ALT + "parameter", DSML_TAG_PREFIX + "parameter")
+        .replace(DSML_CLOSE_PREFIX_ALT + "invoke", DSML_CLOSE_PREFIX + "invoke")
+        .replace(DSML_CLOSE_PREFIX_ALT + "parameter", DSML_CLOSE_PREFIX + "parameter")
+    )
+
+
+def _first_marker_index(text: str, markers: tuple[str, ...]) -> int:
+    indexes = [idx for marker in markers if (idx := text.find(marker)) != -1]
+    return min(indexes) if indexes else -1
+
+
+def _orphan_fragment_start(text: str, marker_idx: int) -> int:
+    """Suppress malformed DSML fragments from the start of their buffered text."""
+    for sentinel in INTERNAL_LEAK_SENTINELS:
+        idx = text.rfind(sentinel, 0, marker_idx)
+        if idx != -1:
+            return text.rfind("\n", 0, idx) + 1
+    return 0
 
 
 def normalize_raw_tool_calls(text: str) -> str:
@@ -81,12 +139,12 @@ def has_any_dsml_prefix(text: str) -> bool:
     if not text:
         return False
     text = _normalize_dsml_bars(text)
-    for marker in (DSML_OPEN, "<DSML>tool_calls>", "<DSML:", "<tool_calls", "<tool_call"):
+    for marker in RAW_TOOL_FRAGMENT_MARKERS:
         if marker in text:
             return True
 
     tail = text[-150:] if len(text) > 150 else text
-    for marker in (DSML_OPEN, "<DSML>tool_calls>", "<tool_calls>", "<tool_call>"):
+    for marker in RAW_TOOL_FRAGMENT_MARKERS:
         max_size = min(len(tail), len(marker) - 1)
         for size in range(max_size, 2, -1):
             if marker.startswith(tail[-size:]):
@@ -96,10 +154,12 @@ def has_any_dsml_prefix(text: str) -> bool:
 
 def find_raw_tool_start(text: str) -> int:
     text = _normalize_dsml_bars(text)
-    for marker in (DSML_OPEN, "<DSML>tool_calls>", "<tool_calls>", "<tool_call>"):
-        idx = text.find(marker)
-        if idx != -1:
-            return idx
+    open_idx = _first_marker_index(text, RAW_TOOL_OPEN_MARKERS)
+    fragment_idx = _first_marker_index(text, RAW_TOOL_FRAGMENT_MARKERS)
+    if open_idx != -1 and (fragment_idx == -1 or open_idx <= fragment_idx):
+        return open_idx
+    if fragment_idx != -1:
+        return _orphan_fragment_start(text, fragment_idx)
     return len(text)
 
 

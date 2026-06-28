@@ -1244,13 +1244,14 @@ class OpencodeCompatHandler(CustomLogger):
 
             if has_any_dsml_prefix(buffer):
                 dsml_mode = True
-                for item in pending:
-                    yield _make_content_chunk(last_id, last_model, last_created, item)
-                pending.clear()
-                if unflushed_text:
-                    yield _make_content_chunk(last_id, last_model, last_created, unflushed_text)
-                    unflushed_text = ""
                 idx = find_raw_tool_start(buffer)
+                if idx > 0:
+                    for item in pending:
+                        yield _make_content_chunk(last_id, last_model, last_created, item)
+                    if unflushed_text:
+                        yield _make_content_chunk(last_id, last_model, last_created, unflushed_text)
+                pending.clear()
+                unflushed_text = ""
                 if idx > previous_buffer_len:
                     yield _make_content_chunk(last_id, last_model, last_created, buffer[previous_buffer_len:idx])
                 continue
@@ -1611,13 +1612,14 @@ class OpencodeCompatHandler(CustomLogger):
         if not revealed_hidden_delta and has_any_dsml_prefix(text_buffer):
             dsml_mode = True
             passthrough_blocked = True
-            for item in pending:
-                yield _messages_text_delta(item, text_block_index, original, delta_type)
-            pending = []
-            if unflushed_text:
-                yield _messages_text_delta(unflushed_text, text_block_index, original, delta_type)
-                unflushed_text = ""
             idx = find_raw_tool_start(text_buffer)
+            if idx > 0:
+                for item in pending:
+                    yield _messages_text_delta(item, text_block_index, original, delta_type)
+                if unflushed_text:
+                    yield _messages_text_delta(unflushed_text, text_block_index, original, delta_type)
+            pending = []
+            unflushed_text = ""
             if idx > previous_text_len:
                 yield _messages_text_delta(text_buffer[previous_text_len:idx], text_block_index, original, delta_type)
             if idx < len(text_buffer):
