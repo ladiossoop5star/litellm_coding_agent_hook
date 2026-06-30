@@ -23,10 +23,6 @@ log = logging.getLogger("opencode_compat_hook")
 SECTION_SIZE = 32
 GUARD_SECTIONS = 2
 ASSISTANT_PLACEHOLDER = "."
-MALFORMED_UNCLOSED_THINK_MESSAGE = (
-    "model output malformed: upstream ended inside an unclosed <think>; "
-    "no usable response or tool call was produced. Retry this step."
-)
 STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
 RAW_THINK_PREVIEW_LIMIT = 200
 MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
@@ -487,8 +483,6 @@ def _strip_internal_artifacts_from_history_text(text: str) -> str:
     cleaned = text
     for pattern in _INTERNAL_ARTIFACT_BLOCK_PATTERNS:
         cleaned = pattern.sub("", cleaned)
-    cleaned = cleaned.replace(MALFORMED_UNCLOSED_THINK_MESSAGE, "")
-    cleaned = re.sub(r"(?m)^\s*model output malformed:\s*$", "", cleaned)
     return cleaned
 
 
@@ -907,15 +901,10 @@ def _raw_think_state() -> Dict[str, Any]:
         "suppressed_chunks": 0,
         "preview": "",
         "visible_chars": 0,
-        "real_content_chars": 0,
         "warned_unclosed": False,
         "placeholder_emitted": False,
-        "malformed_emitted": False,
         "revealing": False,
         "reveal_prefix_emitted": False,
-        "last_event": None,
-        "upstream_stop_reason": None,
-        "upstream_usage": None,
     }
 
 
@@ -969,8 +958,6 @@ def _hidden_thinking_reveal_prefix(state: Dict[str, Any]) -> str:
 def _hidden_thinking_final_fallback(
     state: Dict[str, Any], pending: Iterable[str], unflushed_text: str
 ) -> str:
-    if state.get("in_think"):
-        return ""
     if _raw_think_has_visible_output(state, pending, unflushed_text):
         return ""
     if int(state.get("suppressed_chars") or 0) <= 0:
@@ -978,40 +965,6 @@ def _hidden_thinking_final_fallback(
     state["revealing"] = True
     fallback = _hidden_thinking_reveal_prefix(state)
     state["visible_chars"] = int(state.get("visible_chars") or 0) + len(fallback)
-    return fallback
-
-
-def _record_raw_think_real_content(text: str, state: Dict[str, Any]) -> None:
-    if not text or not text.strip():
-        return
-    state["real_content_chars"] = int(state.get("real_content_chars") or 0) + len(text)
-
-
-def _raw_think_empty_unclosed_final_text(
-    state: Dict[str, Any], context: str, has_native_tool: bool
-) -> str:
-    if not state.get("in_think") or has_native_tool:
-        return ""
-    if int(state.get("visible_chars") or 0) > 0:
-        return ""
-    if state.get("malformed_emitted"):
-        return ""
-
-    _warn_unclosed_raw_think(state, context)
-    state["malformed_emitted"] = True
-    fallback = _hidden_thinking_reveal_prefix(state) or ASSISTANT_PLACEHOLDER
-    state["visible_chars"] = int(state.get("visible_chars") or 0) + len(fallback)
-    log.warning(
-        "emitting visible fallback for empty unclosed raw <think> context=%s chars=%s chunks=%s "
-        "last_event=%s stop_reason=%s usage=%s preview=%r",
-        context,
-        state.get("suppressed_chars") or 0,
-        state.get("suppressed_chunks") or 0,
-        state.get("last_event"),
-        state.get("upstream_stop_reason"),
-        _safe_log_json(state.get("upstream_usage")),
-        str(state.get("preview") or "").replace("\n", "\\n"),
-    )
     return fallback
 
 
@@ -1028,18 +981,6 @@ def _request_context(request_data: Optional[dict]) -> str:
     return " ".join(pieces) or "unknown-request"
 
 
-def _safe_log_json(value: Any, limit: int = 400) -> str:
-    if value is None:
-        return "null"
-    try:
-        text = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
-    except Exception:
-        text = str(value)
-    if len(text) > limit:
-        return text[:limit] + "...(truncated)"
-    return text
-
-
 def _warn_unclosed_raw_think(state: Dict[str, Any], context: str) -> None:
     if not state.get("in_think") or state.get("warned_unclosed"):
         return
@@ -1048,17 +989,11 @@ def _warn_unclosed_raw_think(state: Dict[str, Any], context: str) -> None:
     duration = time.time() - started_at if isinstance(started_at, (int, float)) else 0.0
     preview = str(state.get("preview") or "").replace("\n", "\\n")
     log.warning(
-        "unclosed raw <think> suppressed context=%s chars=%s chunks=%s visible_chars=%s "
-        "real_content_chars=%s duration=%.1fs last_event=%s stop_reason=%s usage=%s preview=%r",
+        "unclosed raw <think> suppressed context=%s chars=%s chunks=%s duration=%.1fs preview=%r",
         context,
         state.get("suppressed_chars") or 0,
         state.get("suppressed_chunks") or 0,
-        state.get("visible_chars") or 0,
-        state.get("real_content_chars") or 0,
         duration,
-        state.get("last_event"),
-        state.get("upstream_stop_reason"),
-        _safe_log_json(state.get("upstream_usage")),
         preview,
     )
     state["warned_unclosed"] = True
@@ -1081,6 +1016,26 @@ def _raw_think_has_visible_output(
         int(state.get("visible_chars") or 0) > 0
         or any(bool(item) for item in pending)
         or bool(unflushed_text)
+    )
+
+
+def _raise_empty_unclosed_raw_think(
+    state: Dict[str, Any],
+    context: str,
+    pending: Iterable[str],
+    unflushed_text: str,
+    has_native_tool: bool,
+) -> None:
+    if not state.get("in_think") or has_native_tool:
+        return
+
+    _warn_unclosed_raw_think(state, context)
+    if _raw_think_has_visible_output(state, pending, unflushed_text):
+        return
+
+    raise RuntimeError(
+        "malformed model output: unclosed raw <think> produced an empty assistant turn "
+        f"({context})"
     )
 
 
@@ -1135,20 +1090,15 @@ def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
         if open_idx == -1:
             tail = _matching_prefix_suffix(data, open_marker)
             if tail:
-                visible_segment = data[:-len(tail)]
-                output.append(visible_segment)
-                _record_raw_think_real_content(visible_segment, state)
+                output.append(data[:-len(tail)])
                 state["tail"] = tail
             else:
                 output.append(data)
-                _record_raw_think_real_content(data, state)
             visible = "".join(output)
             state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
             return visible
 
-        visible_segment = data[:open_idx]
-        output.append(visible_segment)
-        _record_raw_think_real_content(visible_segment, state)
+        output.append(data[:open_idx])
         data = data[open_idx + len(open_marker):]
         state["in_think"] = True
         state["started_at"] = time.time()
@@ -1161,8 +1111,6 @@ def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
 def _flush_raw_think_tail(state: Dict[str, Any]) -> str:
     tail = str(state.get("tail") or "")
     state["tail"] = ""
-    if tail and not state.get("in_think"):
-        _record_raw_think_real_content(tail, state)
     return "" if state.get("in_think") else tail
 
 
@@ -1496,7 +1444,6 @@ class OpencodeCompatHandler(CustomLogger):
                     if not passthrough_blocked:
                         yield _encode_like(raw_event + "\n\n", chunk)
                     continue
-                raw_think["last_event"] = event_name
 
                 if event_name == "content_block_delta":
                     delta = payload.get("delta") or {}
@@ -1552,23 +1499,9 @@ class OpencodeCompatHandler(CustomLogger):
                     open_content_blocks.discard(_event_index(payload, text_block_index))
 
                 if event_name in {"content_block_stop", "message_delta", "message_stop"}:
-                    if event_name == "message_delta":
-                        delta = payload.get("delta") or {}
-                        stop_reason = delta.get("stop_reason")
-                        if stop_reason is not None:
-                            raw_think["upstream_stop_reason"] = stop_reason
-                        if isinstance(payload.get("usage"), dict):
-                            raw_think["upstream_usage"] = payload.get("usage")
                     tail = _flush_raw_think_tail(raw_think)
                     if tail:
                         unflushed_text += tail
-                    empty_unclosed_text = _raw_think_empty_unclosed_final_text(
-                        raw_think,
-                        request_context,
-                        native_tool_index is not None,
-                    )
-                    if empty_unclosed_text:
-                        yield _messages_text_delta(empty_unclosed_text, text_block_index, chunk, "text_delta")
                     fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
                     if fallback:
                         yield _messages_text_delta(fallback, text_block_index, chunk, "text_delta")
@@ -1578,8 +1511,13 @@ class OpencodeCompatHandler(CustomLogger):
                         if stop_reason:
                             saw_stop_message_delta = True
                         if stop_reason == "end_turn":
-                            if raw_think.get("in_think") and not empty_unclosed_text:
-                                _warn_unclosed_raw_think(raw_think, request_context)
+                            _raise_empty_unclosed_raw_think(
+                                raw_think,
+                                request_context,
+                                pending,
+                                unflushed_text,
+                                native_tool_index is not None,
+                            )
                         elif raw_think.get("in_think"):
                             _warn_unclosed_raw_think(raw_think, request_context)
                     elif event_name == "message_stop" and raw_think.get("in_think"):
@@ -1648,14 +1586,7 @@ class OpencodeCompatHandler(CustomLogger):
             tail = _flush_raw_think_tail(raw_think)
             if tail:
                 unflushed_text += tail
-            empty_unclosed_text = _raw_think_empty_unclosed_final_text(
-                raw_think,
-                request_context,
-                native_tool_index is not None,
-            )
-            if empty_unclosed_text:
-                yield _messages_text_delta(empty_unclosed_text, text_block_index, original_for_output, "text_delta")
-            elif raw_think.get("in_think"):
+            if raw_think.get("in_think"):
                 _warn_unclosed_raw_think(raw_think, request_context)
             for item in pending:
                 yield _messages_text_delta(item, text_block_index, original_for_output, text_delta_type)
