@@ -28,6 +28,7 @@ RAW_THINK_PREVIEW_LIMIT = 200
 MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
 MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
+STOP_HOOK_JSON_FALLBACK_SECONDS = 15.0
 _RESPONSES_EMPTY_TOOLS_PATCHED = False
 
 
@@ -829,6 +830,11 @@ async def _iter_with_keepalive(response: Any, request_context: str = "unknown-re
     finally:
         if not next_chunk.done():
             next_chunk.cancel()
+        elif not next_chunk.cancelled():
+            try:
+                next_chunk.exception()
+            except Exception:
+                pass
 
 
 def _is_complete_json_object(text: str) -> bool:
@@ -979,6 +985,76 @@ def _request_context(request_data: Optional[dict]) -> str:
         if value:
             pieces.append(f"{key}={value}")
     return " ".join(pieces) or "unknown-request"
+
+
+def _iter_nested_strings(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_nested_strings(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_nested_strings(item)
+
+
+def _has_stop_hook_marker(value: Any) -> bool:
+    for text in _iter_nested_strings(value):
+        if "hook_event_name" in text and "Stop" in text:
+            return True
+    return False
+
+
+def _has_stop_hook_json_schema(value: Any) -> bool:
+    if isinstance(value, dict):
+        required = value.get("required")
+        if isinstance(required, list) and {"ok", "reason", "impossible"}.issubset(set(required)):
+            return True
+        for item in value.values():
+            if _has_stop_hook_json_schema(item):
+                return True
+    elif isinstance(value, list):
+        return any(_has_stop_hook_json_schema(item) for item in value)
+    return False
+
+
+def _has_stop_hook_condition_prompt(value: Any) -> bool:
+    for text in _iter_nested_strings(value):
+        if (
+            "stopping condition" in text
+            and "hook_event_name" in text
+            and "Stop" in text
+            and "ARGUMENTS" in text
+        ):
+            return True
+    return False
+
+
+def _is_stop_hook_json_evaluator(request_data: Optional[dict]) -> bool:
+    if not _is_messages_stream(request_data):
+        return False
+    if not request_data:
+        return False
+    return _has_stop_hook_marker(request_data) and (
+        _has_stop_hook_json_schema(request_data) or _has_stop_hook_condition_prompt(request_data)
+    )
+
+
+def _stop_hook_json_fallback_text() -> str:
+    return json.dumps(
+        {
+            "ok": False,
+            "reason": (
+                "No usable Stop hook JSON was produced by the upstream model; "
+                "continue because the stopping condition is not proven satisfied."
+            ),
+            "impossible": False,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _warn_unclosed_raw_think(state: Dict[str, Any], context: str) -> None:
@@ -1173,6 +1249,21 @@ def _messages_end_turn_events(index: int, original: Any) -> List[Any]:
     ]
 
 
+def _messages_text_end_turn_events(text: str, index: int, original: Any, start_block: bool = False) -> List[Any]:
+    events: List[Any] = []
+    if start_block:
+        events.append(
+            _sse(
+                "content_block_start",
+                {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}},
+                original,
+            )
+        )
+    events.append(_messages_text_delta(text, index, original, "text_delta"))
+    events.extend(_messages_end_turn_events(index, original))
+    return events
+
+
 class OpencodeCompatHandler(CustomLogger):
     """Compatibility layer for opencode raw DSML/Qwen tool-call output."""
 
@@ -1250,6 +1341,7 @@ class OpencodeCompatHandler(CustomLogger):
                 response,
                 stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
                 request_context=_request_context(request_data),
+                request_data=request_data,
             ):
                 yield chunk
             return
@@ -1398,6 +1490,7 @@ class OpencodeCompatHandler(CustomLogger):
         response: Any,
         stop_after_first_native_tool: bool = False,
         request_context: str = "unknown-request",
+        request_data: Optional[dict] = None,
     ) -> AsyncGenerator[Any, None]:
         text_buffer = ""
         unflushed_text = ""
@@ -1417,6 +1510,9 @@ class OpencodeCompatHandler(CustomLogger):
         saw_message_stop = False
         saw_stop_message_delta = False
         synthetic_stop_sent = False
+        stop_hook_json_evaluator = _is_stop_hook_json_evaluator(request_data)
+        stop_hook_visible_text = False
+        stop_hook_started_at = time.time()
 
         async for chunk in _iter_with_keepalive(response, request_context):
             original_for_output = chunk
@@ -1443,6 +1539,20 @@ class OpencodeCompatHandler(CustomLogger):
                 if payload is None:
                     if not passthrough_blocked:
                         yield _encode_like(raw_event + "\n\n", chunk)
+                    if (
+                        stop_hook_json_evaluator
+                        and not stop_hook_visible_text
+                        and time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                    ):
+                        for event in _messages_text_end_turn_events(
+                            _stop_hook_json_fallback_text(),
+                            text_block_index,
+                            chunk,
+                            start_block=not saw_content_block,
+                        ):
+                            yield event
+                        log.warning("synthesized Stop hook JSON fallback after empty stream context=%s", request_context)
+                        return
                     continue
 
                 if event_name == "content_block_delta":
@@ -1452,6 +1562,30 @@ class OpencodeCompatHandler(CustomLogger):
                     if delta_type in {"text_delta", "thinking_delta"} and isinstance(delta.get(delta_field), str):
                         text_block_index = _event_index(payload, text_block_index)
                         text_delta_type = delta_type
+                        if stop_hook_json_evaluator and delta_type == "thinking_delta":
+                            if raw_think.get("started_at") is None:
+                                raw_think["started_at"] = time.time()
+                            _record_raw_think_suppressed(delta[delta_field], raw_think)
+                            if (
+                                not stop_hook_visible_text
+                                and time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                            ):
+                                for event in _messages_text_end_turn_events(
+                                    _stop_hook_json_fallback_text(),
+                                    text_block_index,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                log.warning(
+                                    "synthesized Stop hook JSON fallback after reasoning-only stream context=%s chars=%s",
+                                    request_context,
+                                    raw_think.get("suppressed_chars") or 0,
+                                )
+                                return
+                            continue
+                        if stop_hook_json_evaluator and delta_type == "text_delta" and delta[delta_field].strip():
+                            stop_hook_visible_text = True
                         async for item in self._handle_messages_text_delta(
                             delta[delta_field],
                             text_block_index,
@@ -1528,6 +1662,8 @@ class OpencodeCompatHandler(CustomLogger):
                         yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
                     pending = []
                     if unflushed_text:
+                        if stop_hook_json_evaluator and unflushed_text.strip():
+                            stop_hook_visible_text = True
                         yield _messages_text_delta(unflushed_text, text_block_index, chunk, text_delta_type)
                         unflushed_text = ""
                     text_buffer = ""
@@ -1595,6 +1731,21 @@ class OpencodeCompatHandler(CustomLogger):
 
         if sse_buffer and not passthrough_blocked:
             yield _encode_like(sse_buffer, original_for_output)
+
+        if stop_hook_json_evaluator and not stop_hook_visible_text and not synthetic_stop_sent:
+            for event in _messages_text_end_turn_events(
+                _stop_hook_json_fallback_text(),
+                text_block_index,
+                original_for_output,
+                start_block=not saw_content_block,
+            ):
+                yield event
+            log.warning(
+                "synthesized Stop hook JSON fallback at stream end context=%s chars=%s",
+                request_context,
+                raw_think.get("suppressed_chars") or 0,
+            )
+            return
 
         if not saw_message_stop and not synthetic_stop_sent:
             for index in sorted(open_content_blocks):
