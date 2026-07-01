@@ -28,7 +28,11 @@ RAW_THINK_PREVIEW_LIMIT = 200
 MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
 MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
-STOP_HOOK_JSON_FALLBACK_SECONDS = 120.0
+STOP_HOOK_KEEPALIVE_SECONDS = 5.0
+# Claude Code Stop hooks can terminate the evaluator process at roughly 30s.
+# Keep this below that deadline so an empty/reasoning-only evaluator stream
+# still returns conservative ok:false JSON instead of looking like no hook output.
+STOP_HOOK_JSON_FALLBACK_SECONDS = 24.0
 _RESPONSES_EMPTY_TOOLS_PATCHED = False
 _RESPONSES_REASONING_TEXT_PATCHED = False
 
@@ -840,7 +844,11 @@ def _sse_comment(text: str, original: Any) -> Any:
     return _encode_like(": " + text + "\n\n", original)
 
 
-async def _iter_with_keepalive(response: Any, request_context: str = "unknown-request") -> AsyncGenerator[Any, None]:
+async def _iter_with_keepalive(
+    response: Any,
+    request_context: str = "unknown-request",
+    keepalive_seconds: float = MESSAGES_STREAM_KEEPALIVE_SECONDS,
+) -> AsyncGenerator[Any, None]:
     iterator = response.__aiter__()
     next_chunk = asyncio.create_task(iterator.__anext__())
     original_for_output: Any = b""
@@ -848,7 +856,7 @@ async def _iter_with_keepalive(response: Any, request_context: str = "unknown-re
 
     try:
         while True:
-            done, _ = await asyncio.wait({next_chunk}, timeout=MESSAGES_STREAM_KEEPALIVE_SECONDS)
+            done, _ = await asyncio.wait({next_chunk}, timeout=keepalive_seconds)
             if not done:
                 idle_seconds = time.time() - last_chunk_at
                 if idle_seconds >= MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS:
@@ -1558,7 +1566,9 @@ class OpencodeCompatHandler(CustomLogger):
         stop_hook_visible_text = False
         stop_hook_started_at = time.time()
 
-        async for chunk in _iter_with_keepalive(response, request_context):
+        keepalive_seconds = STOP_HOOK_KEEPALIVE_SECONDS if stop_hook_json_evaluator else MESSAGES_STREAM_KEEPALIVE_SECONDS
+
+        async for chunk in _iter_with_keepalive(response, request_context, keepalive_seconds=keepalive_seconds):
             original_for_output = chunk
             if stop_after_first_native_tool:
                 complete_openai_tool = _first_complete_openai_tool_call(openai_tool_state, _delta(chunk))
