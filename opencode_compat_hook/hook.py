@@ -30,6 +30,7 @@ MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_JSON_FALLBACK_SECONDS = 120.0
 _RESPONSES_EMPTY_TOOLS_PATCHED = False
+_RESPONSES_REASONING_TEXT_PATCHED = False
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -764,6 +765,48 @@ def _patch_litellm_responses_empty_tools_bridge() -> None:
         log.warning("failed to patch LiteLLM Responses empty-tools bridge: %s", exc)
 
 
+def _patch_litellm_responses_reasoning_text_bridge() -> None:
+    global _RESPONSES_REASONING_TEXT_PATCHED
+
+    if _RESPONSES_REASONING_TEXT_PATCHED:
+        return
+
+    try:
+        from litellm.completion_extras.litellm_responses_transformation.transformation import (
+            OpenAiResponsesToChatCompletionStreamIterator,
+        )
+
+        original = OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream
+        if getattr(original, "_opencode_reasoning_text_patched", False):
+            _RESPONSES_REASONING_TEXT_PATCHED = True
+            return
+
+        def patched_translate(parsed_chunk: Any) -> ModelResponseStream:
+            chunk = parsed_chunk.model_dump() if hasattr(parsed_chunk, "model_dump") else parsed_chunk
+            if isinstance(chunk, dict) and chunk.get("type") == "response.reasoning_text.delta":
+                content_part = chunk.get("delta")
+                if isinstance(content_part, str) and content_part:
+                    return ModelResponseStream(
+                        choices=[
+                            {
+                                "index": int(chunk.get("summary_index") or 0),
+                                "delta": {"reasoning_content": content_part},
+                                "finish_reason": None,
+                            }
+                        ]
+                    )
+            return original(parsed_chunk)
+
+        setattr(patched_translate, "_opencode_reasoning_text_patched", True)
+        OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream = staticmethod(
+            patched_translate
+        )
+        _RESPONSES_REASONING_TEXT_PATCHED = True
+        log.info("patched LiteLLM Responses bridge to preserve reasoning_text deltas")
+    except Exception as exc:
+        log.warning("failed to patch LiteLLM Responses reasoning_text bridge: %s", exc)
+
+
 def _encode_like(text: str, original: Any) -> Any:
     if isinstance(original, (bytes, bytearray)):
         return text.encode("utf-8")
@@ -1269,6 +1312,7 @@ class OpencodeCompatHandler(CustomLogger):
 
     def __init__(self) -> None:
         _patch_litellm_responses_empty_tools_bridge()
+        _patch_litellm_responses_reasoning_text_bridge()
         self._register_input_tokens_route()
 
     def _register_input_tokens_route(self) -> None:
