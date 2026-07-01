@@ -29,10 +29,8 @@ MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
 MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_KEEPALIVE_SECONDS = 5.0
-# Claude Code Stop hooks can terminate the evaluator process at roughly 30s.
-# Keep this below that deadline so an empty/reasoning-only evaluator stream
-# still returns conservative ok:false JSON instead of looking like no hook output.
-STOP_HOOK_JSON_FALLBACK_SECONDS = 24.0
+STOP_HOOK_JSON_FALLBACK_SECONDS = 120.0
+COUNT_TOKENS_NATIVE_MAX_ESTIMATE = 8192
 _RESPONSES_EMPTY_TOOLS_PATCHED = False
 _RESPONSES_REASONING_TEXT_PATCHED = False
 
@@ -1315,6 +1313,85 @@ def _messages_text_end_turn_events(text: str, index: int, original: Any, start_b
     return events
 
 
+def _estimate_count_tokens(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        cjk_chars = sum(
+            1
+            for char in value
+            if "\u3400" <= char <= "\u9fff"
+            or "\uf900" <= char <= "\ufaff"
+            or "\u3040" <= char <= "\u30ff"
+            or "\uac00" <= char <= "\ud7af"
+        )
+        other_chars = len(value) - cjk_chars
+        return cjk_chars + (other_chars + 3) // 4
+    if isinstance(value, (int, float, bool)):
+        return 1
+    if isinstance(value, dict):
+        return 4 + sum(_estimate_count_tokens(k) + _estimate_count_tokens(v) for k, v in value.items())
+    if isinstance(value, list):
+        return 2 + sum(_estimate_count_tokens(item) for item in value)
+    return (len(str(value)) + 2) // 3
+
+
+def _estimate_anthropic_messages_tokens(payload: Dict[str, Any]) -> int:
+    total = 0
+    total += _estimate_count_tokens(payload.get("system"))
+    total += _estimate_count_tokens(payload.get("messages"))
+    total += _estimate_count_tokens(payload.get("tools"))
+    total += _estimate_count_tokens(payload.get("tool_choice"))
+    # Account for role/content framing and request metadata that local tokenizers
+    # do not see but model chat templates do.
+    message_count = len(payload.get("messages") or []) if isinstance(payload.get("messages"), list) else 0
+    tool_count = len(payload.get("tools") or []) if isinstance(payload.get("tools"), list) else 0
+    total += 128 + message_count * 12 + tool_count * 24
+    return max(1, int(total * 1.10))
+
+
+def _extract_input_tokens(value: Any) -> Optional[int]:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    if hasattr(value, "body"):
+        try:
+            value = json.loads(value.body)
+        except Exception:
+            return None
+    if isinstance(value, dict):
+        tokens = value.get("input_tokens", value.get("total_tokens"))
+        try:
+            return int(tokens)
+        except Exception:
+            return None
+    return None
+
+
+def _message_start_with_estimated_usage(payload: Dict[str, Any], request_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return payload
+    usage = message.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    try:
+        if int(usage.get("input_tokens") or 0) > 0:
+            return payload
+    except Exception:
+        pass
+
+    estimated_tokens = _estimate_anthropic_messages_tokens(request_data or {})
+    patched_payload = dict(payload)
+    patched_message = dict(message)
+    patched_usage = dict(usage)
+    patched_usage["input_tokens"] = estimated_tokens
+    patched_usage.setdefault("output_tokens", 0)
+    patched_usage.setdefault("cache_creation_input_tokens", 0)
+    patched_usage.setdefault("cache_read_input_tokens", 0)
+    patched_message["usage"] = patched_usage
+    patched_payload["message"] = patched_message
+    return patched_payload
+
+
 class OpencodeCompatHandler(CustomLogger):
     """Compatibility layer for opencode raw DSML/Qwen tool-call output."""
 
@@ -1322,6 +1399,7 @@ class OpencodeCompatHandler(CustomLogger):
         _patch_litellm_responses_empty_tools_bridge()
         _patch_litellm_responses_reasoning_text_bridge()
         self._register_input_tokens_route()
+        self._register_messages_count_tokens_route()
 
     def _register_input_tokens_route(self) -> None:
         try:
@@ -1356,6 +1434,77 @@ class OpencodeCompatHandler(CustomLogger):
             log.info("registered opencode compatibility route %s", route_path)
         except Exception as exc:
             log.warning("failed to register /v1/responses/input_tokens route: %s", exc)
+
+    def _register_messages_count_tokens_route(self) -> None:
+        try:
+            from fastapi import Depends, Request
+            from fastapi.responses import JSONResponse
+            from fastapi.routing import APIRoute
+            from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+            from litellm.proxy.proxy_server import app
+
+            route_paths = ("/v1/messages/count_tokens", "/messages/count_tokens")
+            route_name = "opencode_messages_count_tokens"
+            original_endpoints: Dict[str, Any] = {}
+            for route in getattr(app, "routes", []):
+                if getattr(route, "name", None) == route_name:
+                    return
+                path = getattr(route, "path", None)
+                endpoint = getattr(route, "endpoint", None)
+                if path in route_paths and endpoint is not None:
+                    original_endpoints[str(path)] = endpoint
+
+            def get_original_endpoint(request: Request) -> Any:
+                original = original_endpoints.get(request.url.path)
+                if original is not None:
+                    return original
+                for route in getattr(request.app, "routes", []):
+                    if getattr(route, "name", None) == route_name:
+                        continue
+                    if getattr(route, "path", None) != request.url.path:
+                        continue
+                    endpoint = getattr(route, "endpoint", None)
+                    if endpoint is not None:
+                        original_endpoints[request.url.path] = endpoint
+                        return endpoint
+                return None
+
+            async def opencode_messages_count_tokens(request: Request):
+                try:
+                    body = await request.body()
+                    payload = json.loads(body) if body else {}
+                    payload = payload if isinstance(payload, dict) else {}
+                except Exception:
+                    payload = {}
+                estimated_tokens = _estimate_anthropic_messages_tokens(payload)
+                if estimated_tokens >= COUNT_TOKENS_NATIVE_MAX_ESTIMATE:
+                    return JSONResponse(content={"input_tokens": estimated_tokens})
+
+                original = get_original_endpoint(request)
+                if original is not None:
+                    try:
+                        native_response = await original(request=request)
+                        native_tokens = _extract_input_tokens(native_response)
+                        if native_tokens and native_tokens > 0:
+                            return JSONResponse(content={"input_tokens": native_tokens})
+                    except Exception as exc:
+                        log.warning("native messages count_tokens failed; using estimate: %s", exc)
+
+                return JSONResponse(content={"input_tokens": estimated_tokens})
+
+            for route_path in reversed(route_paths):
+                route = APIRoute(
+                    path=route_path,
+                    endpoint=opencode_messages_count_tokens,
+                    methods=["POST"],
+                    name=route_name,
+                    dependencies=[Depends(user_api_key_auth)],
+                )
+                app.router.routes.insert(0, route)
+
+            log.info("registered opencode compatibility routes %s", ", ".join(route_paths))
+        except Exception as exc:
+            log.warning("failed to register messages count_tokens compatibility route: %s", exc)
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
         _sanitize_request_tools(data, call_type)
@@ -1722,7 +1871,14 @@ class OpencodeCompatHandler(CustomLogger):
                         unflushed_text = ""
                     text_buffer = ""
 
-                yield _encode_like(raw_event + "\n\n", chunk)
+                if event_name == "message_start":
+                    yield _sse(
+                        event_name,
+                        _message_start_with_estimated_usage(payload, request_data),
+                        chunk,
+                    )
+                else:
+                    yield _encode_like(raw_event + "\n\n", chunk)
 
                 if (
                     stop_after_first_native_tool
