@@ -1010,10 +1010,23 @@ def _hidden_thinking_reveal_prefix(state: Dict[str, Any]) -> str:
     return preview
 
 
+def _raw_think_preview_has_tool_prefix(state: Dict[str, Any]) -> bool:
+    preview = str(state.get("preview") or "")
+    if not preview:
+        return False
+    lowered = preview.lower()
+    return (
+        "<tool_call" in lowered
+        or "<｜dsml｜tool_calls" in lowered
+        or "<|dsml|tool_calls" in lowered
+        or has_any_dsml_prefix(preview)
+    )
+
+
 def _hidden_thinking_final_fallback(
     state: Dict[str, Any], pending: Iterable[str], unflushed_text: str
 ) -> str:
-    if state.get("in_think"):
+    if state.get("in_think") and _raw_think_preview_has_tool_prefix(state):
         return ""
     if _raw_think_has_visible_output(state, pending, unflushed_text):
         return ""
