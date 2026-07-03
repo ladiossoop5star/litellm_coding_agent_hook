@@ -1013,6 +1013,8 @@ def _hidden_thinking_reveal_prefix(state: Dict[str, Any]) -> str:
 def _hidden_thinking_final_fallback(
     state: Dict[str, Any], pending: Iterable[str], unflushed_text: str
 ) -> str:
+    if state.get("in_think"):
+        return ""
     if _raw_think_has_visible_output(state, pending, unflushed_text):
         return ""
     if int(state.get("suppressed_chars") or 0) <= 0:
@@ -2149,40 +2151,35 @@ class OpencodeCompatHandler(CustomLogger):
         raw_think = state["raw_think"]
         passthrough_blocked = False
 
-        probe_buffer = text_buffer + text
-        should_parse_tool = (
-            dsml_mode
-            or has_complete_raw_tool_block(probe_buffer)
-            or has_any_dsml_prefix(probe_buffer)
-        )
-
         if delta_type == "thinking_delta":
-            if not should_parse_tool:
-                if raw_think.get("started_at") is None:
-                    raw_think["started_at"] = time.time()
-                if _should_reveal_hidden_thinking(raw_think):
-                    visible_text = _hidden_thinking_reveal_prefix(raw_think) + text
-                    raw_think["visible_chars"] = int(raw_think.get("visible_chars") or 0) + len(visible_text)
-                    yield _messages_text_delta(visible_text, text_block_index, original, "text_delta")
-                else:
-                    _record_raw_think_suppressed(text, raw_think)
-                    yield _messages_text_delta(text, text_block_index, original, "thinking_delta")
-                yield {
-                    "_state": True,
-                    "text_buffer": text_buffer,
-                    "unflushed_text": unflushed_text,
-                    "pending": pending,
-                    "dsml_mode": dsml_mode,
-                    "raw_think": raw_think,
-                    "passthrough_blocked": passthrough_blocked,
-                }
-                return
+            if raw_think.get("started_at") is None:
+                raw_think["started_at"] = time.time()
+            if _should_reveal_hidden_thinking(raw_think):
+                visible_text = _hidden_thinking_reveal_prefix(raw_think) + text
+                raw_think["visible_chars"] = int(raw_think.get("visible_chars") or 0) + len(visible_text)
+                yield _messages_text_delta(visible_text, text_block_index, original, "text_delta")
+            else:
+                _record_raw_think_suppressed(text, raw_think)
+                yield _messages_text_delta(text, text_block_index, original, "thinking_delta")
+            yield {
+                "_state": True,
+                "text_buffer": text_buffer,
+                "unflushed_text": unflushed_text,
+                "pending": pending,
+                "dsml_mode": dsml_mode,
+                "raw_think": raw_think,
+                "passthrough_blocked": passthrough_blocked,
+            }
+            return
 
         raw_think["_revealed_delta"] = False
-        if should_parse_tool:
+        if dsml_mode:
             safe_text = text
             revealed_hidden_delta = False
         else:
+            # Raw tool parsing must only see visible assistant content. If a model emits
+            # "<think>\n<tool_call>" without closing the thought, the tool prefix should
+            # remain suppressed with the hidden text instead of leaking a bare <think>.
             safe_text = _strip_raw_think_delta(text, raw_think)
             revealed_hidden_delta = bool(raw_think.pop("_revealed_delta", False))
         previous_text_len = len(text_buffer)
