@@ -1537,11 +1537,12 @@ class OpencodeCompatHandler(CustomLogger):
     async def async_post_call_streaming_iterator_hook(
         self, user_api_key_dict: Any, response: Any, request_data: dict
     ) -> AsyncGenerator[Any, None]:
+        request_context = _request_context(request_data)
         if _is_messages_stream(request_data):
             async for chunk in self._convert_anthropic_messages_stream(
                 response,
                 stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
-                request_context=_request_context(request_data),
+                request_context=request_context,
                 request_data=request_data,
             ):
                 yield chunk
@@ -1559,6 +1560,7 @@ class OpencodeCompatHandler(CustomLogger):
         content_collected = False
         raw_stream_passthrough = False
         thinking_state = 0
+        raw_think = _raw_think_state()
         last_id = "chatcmpl-opencode-compat"
         last_model = request_data.get("model", "unknown") if request_data else "unknown"
         last_created = int(time.time())
@@ -1616,7 +1618,10 @@ class OpencodeCompatHandler(CustomLogger):
                 if thinking_state == 1:
                     chunk_text += "\n</think>\n"
                     thinking_state = 2
-                chunk_text += raw_chunk_text
+                chunk_text += _strip_raw_think_delta(raw_chunk_text, raw_think)
+
+            if not chunk_text:
+                continue
 
             previous_buffer_len = len(buffer)
             buffer += chunk_text
@@ -1668,6 +1673,14 @@ class OpencodeCompatHandler(CustomLogger):
         if thinking_state == 1:
             unflushed_text += "\n</think>\n"
 
+        tail = _flush_raw_think_tail(raw_think)
+        if tail:
+            unflushed_text += tail
+        fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+        if fallback:
+            unflushed_text += fallback
+        _raise_empty_unclosed_raw_think(raw_think, request_context, pending, unflushed_text, False)
+
         if dsml_mode:
             if content_collected:
                 idx = find_raw_tool_start(buffer)
@@ -1710,10 +1723,12 @@ class OpencodeCompatHandler(CustomLogger):
         openai_tool_state: Dict[int, Dict[str, str]] = {}
         saw_message_stop = False
         saw_stop_message_delta = False
+        saw_message_start = False
         synthetic_stop_sent = False
         stop_hook_json_evaluator = _is_stop_hook_json_evaluator(request_data)
         stop_hook_visible_text = False
         stop_hook_started_at = time.time()
+        openai_sse_mode = False
 
         keepalive_seconds = STOP_HOOK_KEEPALIVE_SECONDS if stop_hook_json_evaluator else MESSAGES_STREAM_KEEPALIVE_SECONDS
 
@@ -1740,6 +1755,23 @@ class OpencodeCompatHandler(CustomLogger):
 
                 event_name, payload = _parse_sse_event(raw_event)
                 if payload is None:
+                    if openai_sse_mode and "[DONE]" in raw_event:
+                        if not saw_message_stop and not synthetic_stop_sent:
+                            for index in sorted(open_content_blocks):
+                                yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
+                            if not saw_stop_message_delta:
+                                yield _sse(
+                                    "message_delta",
+                                    {
+                                        "type": "message_delta",
+                                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                        "usage": {"output_tokens": 0},
+                                    },
+                                    chunk,
+                                )
+                            yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                            synthetic_stop_sent = True
+                        continue
                     if not passthrough_blocked:
                         yield _encode_like(raw_event + "\n\n", chunk)
                     if (
@@ -1755,6 +1787,134 @@ class OpencodeCompatHandler(CustomLogger):
                         ):
                             yield event
                         log.warning("synthesized Stop hook JSON fallback after empty stream context=%s", request_context)
+                        return
+                    continue
+
+                if event_name in (None, "") and _choice(payload) is not None:
+                    openai_sse_mode = True
+                    passthrough_blocked = True
+                    if not saw_message_start:
+                        yield _sse(
+                            "message_start",
+                            _message_start_with_estimated_usage(
+                                {
+                                    "type": "message_start",
+                                    "message": {
+                                        "id": _chunk_id(payload, "msg_opencode_compat"),
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "model": _chunk_model(payload, "unknown"),
+                                        "content": [],
+                                        "stop_reason": None,
+                                        "stop_sequence": None,
+                                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                                    },
+                                },
+                                request_data,
+                            ),
+                            chunk,
+                        )
+                        saw_message_start = True
+
+                    delta = _delta(payload)
+                    complete_openai_tool = _first_complete_openai_tool_call(openai_tool_state, delta)
+                    if complete_openai_tool:
+                        for index in sorted(open_content_blocks):
+                            yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
+                        tool_index = max(open_content_blocks | {text_block_index}) + 1 if saw_content_block else 0
+                        for event in _messages_tool_use_events([complete_openai_tool], tool_index, chunk):
+                            yield event
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                                "usage": {"output_tokens": 0},
+                            },
+                            chunk,
+                        )
+                        yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                        synthetic_stop_sent = True
+                        log.info("synthesized messages native tool stop from OpenAI SSE context=%s", request_context)
+                        return
+
+                    chunk_text = _content_from_delta(delta) or _reasoning_from_delta(delta)
+                    if chunk_text:
+                        if not saw_content_block:
+                            yield _sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": text_block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                },
+                                chunk,
+                            )
+                            saw_content_block = True
+                            open_content_blocks.add(text_block_index)
+                        async for item in self._handle_messages_text_delta(
+                            chunk_text,
+                            text_block_index,
+                            chunk,
+                            "text_delta",
+                            state={
+                                "text_buffer": text_buffer,
+                                "unflushed_text": unflushed_text,
+                                "pending": pending,
+                                "dsml_mode": dsml_mode,
+                                "raw_think": raw_think,
+                            },
+                        ):
+                            if isinstance(item, dict) and item.get("_state"):
+                                text_buffer = item["text_buffer"]
+                                unflushed_text = item["unflushed_text"]
+                                pending = item["pending"]
+                                dsml_mode = item["dsml_mode"]
+                                raw_think = item["raw_think"]
+                                passthrough_blocked = item["passthrough_blocked"]
+                                synthetic_stop_sent = synthetic_stop_sent or bool(item.get("stop_sent"))
+                            else:
+                                yield item
+
+                    choice = _choice(payload)
+                    finish_reason = _get(choice, "finish_reason", None)
+                    if finish_reason:
+                        tail = _flush_raw_think_tail(raw_think)
+                        if tail:
+                            unflushed_text += tail
+                        fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+                        if fallback:
+                            yield _messages_text_delta(fallback, text_block_index, chunk, "text_delta")
+                        _raise_empty_unclosed_raw_think(
+                            raw_think,
+                            request_context,
+                            pending,
+                            unflushed_text,
+                            any(bool(entry.get("name")) for entry in openai_tool_state.values()),
+                        )
+                        for item in pending:
+                            yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
+                        pending = []
+                        if unflushed_text:
+                            yield _messages_text_delta(unflushed_text, text_block_index, chunk, text_delta_type)
+                            unflushed_text = ""
+                        for index in sorted(open_content_blocks):
+                            yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
+                        open_content_blocks.clear()
+                        stop_reason = "tool_use" if str(finish_reason) == "tool_calls" else "end_turn"
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                                "usage": {"output_tokens": 0},
+                            },
+                            chunk,
+                        )
+                        yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                        saw_stop_message_delta = True
+                        saw_message_stop = True
+                        synthetic_stop_sent = True
                         return
                     continue
 
@@ -1872,6 +2032,7 @@ class OpencodeCompatHandler(CustomLogger):
                     text_buffer = ""
 
                 if event_name == "message_start":
+                    saw_message_start = True
                     yield _sse(
                         event_name,
                         _message_start_with_estimated_usage(payload, request_data),
