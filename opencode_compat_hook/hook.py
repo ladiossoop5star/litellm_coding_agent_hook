@@ -1121,6 +1121,13 @@ def _stop_hook_json_fallback_text() -> str:
     )
 
 
+def _incomplete_raw_tool_fallback_text() -> str:
+    return (
+        "model output malformed: upstream ended inside an incomplete raw tool call; "
+        "no usable response or tool call was produced. Retry this step."
+    )
+
+
 def _warn_unclosed_raw_think(state: Dict[str, Any], context: str) -> None:
     if not state.get("in_think") or state.get("warned_unclosed"):
         return
@@ -2096,14 +2103,41 @@ class OpencodeCompatHandler(CustomLogger):
 
         if dsml_mode:
             idx = find_raw_tool_start(text_buffer)
+            visible_prefix = text_buffer[:idx] if idx > 0 else ""
             if idx > 0:
-                yield _messages_text_delta(text_buffer[:idx], text_block_index, original_for_output, text_delta_type)
+                yield _messages_text_delta(visible_prefix, text_block_index, original_for_output, text_delta_type)
             if idx < len(text_buffer):
                 log.warning(
                     "suppressing incomplete messages raw tool block context=%s preview=%r",
                     request_context,
                     text_buffer[idx:idx + 800].replace("\n", "\\n"),
                 )
+                if stop_hook_json_evaluator and not synthetic_stop_sent:
+                    for event in _messages_text_end_turn_events(
+                        _stop_hook_json_fallback_text(),
+                        text_block_index,
+                        original_for_output,
+                        start_block=not saw_content_block,
+                    ):
+                        yield event
+                    log.warning(
+                        "synthesized Stop hook JSON fallback after incomplete raw tool block context=%s",
+                        request_context,
+                    )
+                    return
+                if not any(bool(item) for item in pending) and not unflushed_text and not visible_prefix.strip():
+                    for event in _messages_text_end_turn_events(
+                        _incomplete_raw_tool_fallback_text(),
+                        text_block_index,
+                        original_for_output,
+                        start_block=not saw_content_block,
+                    ):
+                        yield event
+                    log.warning(
+                        "synthesized malformed fallback after incomplete raw tool block context=%s",
+                        request_context,
+                    )
+                    return
         else:
             tail = _flush_raw_think_tail(raw_think)
             if tail:
