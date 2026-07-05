@@ -850,15 +850,20 @@ async def _iter_with_keepalive(
     response: Any,
     request_context: str = "unknown-request",
     keepalive_seconds: float = MESSAGES_STREAM_KEEPALIVE_SECONDS,
+    force_keepalive_at: Optional[float] = None,
 ) -> AsyncGenerator[Any, None]:
     iterator = response.__aiter__()
     next_chunk = asyncio.create_task(iterator.__anext__())
     original_for_output: Any = b""
     last_chunk_at = time.time()
+    forced_keepalive_sent = False
 
     try:
         while True:
-            done, _ = await asyncio.wait({next_chunk}, timeout=keepalive_seconds)
+            timeout = keepalive_seconds
+            if force_keepalive_at is not None and not forced_keepalive_sent:
+                timeout = min(timeout, max(0.0, force_keepalive_at - time.time()))
+            done, _ = await asyncio.wait({next_chunk}, timeout=timeout)
             if not done:
                 idle_seconds = time.time() - last_chunk_at
                 if idle_seconds >= MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS:
@@ -868,6 +873,8 @@ async def _iter_with_keepalive(
                         request_context,
                     )
                     break
+                if force_keepalive_at is not None and time.time() >= force_keepalive_at:
+                    forced_keepalive_sent = True
                 yield _sse_comment("opencode-compat keepalive", original_for_output)
                 continue
 
@@ -1877,7 +1884,16 @@ class OpencodeCompatHandler(CustomLogger):
 
         keepalive_seconds = STOP_HOOK_KEEPALIVE_SECONDS if stop_hook_json_evaluator else MESSAGES_STREAM_KEEPALIVE_SECONDS
 
-        async for chunk in _iter_with_keepalive(response, request_context, keepalive_seconds=keepalive_seconds):
+        force_keepalive_at = None
+        if stop_hook_json_evaluator:
+            force_keepalive_at = stop_hook_started_at + STOP_HOOK_JSON_FALLBACK_SECONDS
+
+        async for chunk in _iter_with_keepalive(
+            response,
+            request_context,
+            keepalive_seconds=keepalive_seconds,
+            force_keepalive_at=force_keepalive_at,
+        ):
             original_for_output = chunk
             if stop_after_first_native_tool:
                 complete_openai_tool = _first_complete_openai_tool_call(openai_tool_state, _delta(chunk))
