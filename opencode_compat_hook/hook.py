@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import json
 import logging
 import re
@@ -29,10 +30,13 @@ MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
 MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_KEEPALIVE_SECONDS = 5.0
-STOP_HOOK_JSON_FALLBACK_SECONDS = 120.0
+STOP_HOOK_JSON_FALLBACK_SECONDS = 28.0
+STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
 COUNT_TOKENS_NATIVE_MAX_ESTIMATE = 8192
 _RESPONSES_EMPTY_TOOLS_PATCHED = False
 _RESPONSES_REASONING_TEXT_PATCHED = False
+_STOP_HOOK_JSON_FALLBACK_COUNTS_PATH = "/tmp/opencode_compat_stop_hook_fallback_counts.json"
+_STOP_HOOK_JSON_FALLBACK_COUNTS: Dict[str, int] = {}
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -1051,6 +1055,32 @@ def _request_context(request_data: Optional[dict]) -> str:
     return " ".join(pieces) or "unknown-request"
 
 
+def _stop_hook_session_key(request_data: Optional[dict], request_context: str) -> str:
+    if not request_data:
+        return request_context
+    metadata = request_data.get("litellm_metadata") or {}
+    headers = metadata.get("headers") or {}
+    if isinstance(headers, dict):
+        for key in ("x-claude-code-session-id", "session-id", "x-client-request-id"):
+            value = headers.get(key)
+            if value:
+                return str(value)
+    for key in ("session_id", "trace_id"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    for text in _iter_nested_strings(request_data.get("metadata") or {}):
+        if "session_id" not in text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("session_id"):
+            return str(parsed["session_id"])
+    return request_context
+
+
 def _iter_nested_strings(value: Any) -> Iterable[str]:
     if isinstance(value, str):
         yield value
@@ -1119,6 +1149,97 @@ def _stop_hook_json_fallback_text() -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _is_valid_stop_hook_json_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    if not isinstance(parsed.get("ok"), bool):
+        return False
+    if not isinstance(parsed.get("reason"), str):
+        return False
+    impossible = parsed.get("impossible")
+    return impossible is None or isinstance(impossible, bool)
+
+
+def _mutate_stop_hook_fallback_counts(mutator: Any) -> Any:
+    try:
+        with open(_STOP_HOOK_JSON_FALLBACK_COUNTS_PATH, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            raw = handle.read().strip()
+            counts = json.loads(raw) if raw else {}
+            if not isinstance(counts, dict):
+                counts = {}
+            result = mutator(counts)
+            handle.seek(0)
+            handle.truncate()
+            json.dump(counts, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return result
+    except Exception as exc:
+        log.warning("Stop hook fallback counter file unavailable, using process memory: %s", exc)
+        return mutator(_STOP_HOOK_JSON_FALLBACK_COUNTS)
+
+
+def _stop_hook_json_fallback_available(session_key: str, request_context: str) -> bool:
+    def mutate(counts: Dict[str, Any]) -> Tuple[bool, int]:
+        count = int(counts.get(session_key) or 0)
+        if count < STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE:
+            return True, count
+        counts.pop(session_key, None)
+        return False, count
+
+    available, count = _mutate_stop_hook_fallback_counts(mutate)
+    if available:
+        return True
+    log.warning(
+        "Stop hook JSON fallback suppressed after %d consecutive fallbacks and counter reset session=%s context=%s",
+        count,
+        session_key,
+        request_context,
+    )
+    return False
+
+
+def _record_stop_hook_json_fallback(session_key: str, request_context: str, reason: str) -> None:
+    def mutate(counts: Dict[str, Any]) -> int:
+        count = int(counts.get(session_key) or 0) + 1
+        counts[session_key] = count
+        return count
+
+    count = _mutate_stop_hook_fallback_counts(mutate)
+    log.warning(
+        "Stop hook JSON fallback count=%d/%d reason=%s session=%s context=%s",
+        count,
+        STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE,
+        reason,
+        session_key,
+        request_context,
+    )
+
+
+def _record_stop_hook_valid_json(session_key: str, request_context: str) -> None:
+    def mutate(counts: Dict[str, Any]) -> int:
+        previous = int(counts.pop(session_key, 0) or 0)
+        return previous
+
+    previous = _mutate_stop_hook_fallback_counts(mutate)
+    if previous:
+        log.info(
+            "Stop hook JSON fallback counter reset after valid JSON previous=%d session=%s context=%s",
+            previous,
+            session_key,
+            request_context,
+        )
 
 
 def _incomplete_raw_tool_fallback_text() -> str:
@@ -1748,7 +1869,9 @@ class OpencodeCompatHandler(CustomLogger):
         saw_message_start = False
         synthetic_stop_sent = False
         stop_hook_json_evaluator = _is_stop_hook_json_evaluator(request_data)
+        stop_hook_session_key = _stop_hook_session_key(request_data, request_context)
         stop_hook_visible_text = False
+        stop_hook_text_buffer = ""
         stop_hook_started_at = time.time()
         openai_sse_mode = False
 
@@ -1800,6 +1923,7 @@ class OpencodeCompatHandler(CustomLogger):
                         stop_hook_json_evaluator
                         and not stop_hook_visible_text
                         and time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                        and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
                     ):
                         for event in _messages_text_end_turn_events(
                             _stop_hook_json_fallback_text(),
@@ -1808,6 +1932,11 @@ class OpencodeCompatHandler(CustomLogger):
                             start_block=not saw_content_block,
                         ):
                             yield event
+                        _record_stop_hook_json_fallback(
+                            stop_hook_session_key,
+                            request_context,
+                            "empty-stream",
+                        )
                         log.warning("synthesized Stop hook JSON fallback after empty stream context=%s", request_context)
                         return
                     continue
@@ -1862,6 +1991,10 @@ class OpencodeCompatHandler(CustomLogger):
 
                     chunk_text = _content_from_delta(delta) or _reasoning_from_delta(delta)
                     if chunk_text:
+                        if stop_hook_json_evaluator:
+                            stop_hook_text_buffer += chunk_text
+                            if _is_valid_stop_hook_json_text(stop_hook_text_buffer):
+                                _record_stop_hook_valid_json(stop_hook_session_key, request_context)
                         if not saw_content_block:
                             yield _sse(
                                 "content_block_start",
@@ -1954,6 +2087,7 @@ class OpencodeCompatHandler(CustomLogger):
                             if (
                                 not stop_hook_visible_text
                                 and time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                                and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
                             ):
                                 for event in _messages_text_end_turn_events(
                                     _stop_hook_json_fallback_text(),
@@ -1962,6 +2096,11 @@ class OpencodeCompatHandler(CustomLogger):
                                     start_block=not saw_content_block,
                                 ):
                                     yield event
+                                _record_stop_hook_json_fallback(
+                                    stop_hook_session_key,
+                                    request_context,
+                                    "reasoning-only",
+                                )
                                 log.warning(
                                     "synthesized Stop hook JSON fallback after reasoning-only stream context=%s chars=%s",
                                     request_context,
@@ -1971,6 +2110,9 @@ class OpencodeCompatHandler(CustomLogger):
                             continue
                         if stop_hook_json_evaluator and delta_type == "text_delta" and delta[delta_field].strip():
                             stop_hook_visible_text = True
+                            stop_hook_text_buffer += delta[delta_field]
+                            if _is_valid_stop_hook_json_text(stop_hook_text_buffer):
+                                _record_stop_hook_valid_json(stop_hook_session_key, request_context)
                         async for item in self._handle_messages_text_delta(
                             delta[delta_field],
                             text_block_index,
@@ -2112,7 +2254,11 @@ class OpencodeCompatHandler(CustomLogger):
                     request_context,
                     text_buffer[idx:idx + 800].replace("\n", "\\n"),
                 )
-                if stop_hook_json_evaluator and not synthetic_stop_sent:
+                if (
+                    stop_hook_json_evaluator
+                    and not synthetic_stop_sent
+                    and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
+                ):
                     for event in _messages_text_end_turn_events(
                         _stop_hook_json_fallback_text(),
                         text_block_index,
@@ -2120,6 +2266,11 @@ class OpencodeCompatHandler(CustomLogger):
                         start_block=not saw_content_block,
                     ):
                         yield event
+                    _record_stop_hook_json_fallback(
+                        stop_hook_session_key,
+                        request_context,
+                        "incomplete-raw-tool",
+                    )
                     log.warning(
                         "synthesized Stop hook JSON fallback after incomplete raw tool block context=%s",
                         request_context,
@@ -2152,7 +2303,12 @@ class OpencodeCompatHandler(CustomLogger):
         if sse_buffer and not passthrough_blocked:
             yield _encode_like(sse_buffer, original_for_output)
 
-        if stop_hook_json_evaluator and not stop_hook_visible_text and not synthetic_stop_sent:
+        if (
+            stop_hook_json_evaluator
+            and not stop_hook_visible_text
+            and not synthetic_stop_sent
+            and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
+        ):
             for event in _messages_text_end_turn_events(
                 _stop_hook_json_fallback_text(),
                 text_block_index,
@@ -2160,6 +2316,11 @@ class OpencodeCompatHandler(CustomLogger):
                 start_block=not saw_content_block,
             ):
                 yield event
+            _record_stop_hook_json_fallback(
+                stop_hook_session_key,
+                request_context,
+                "stream-end",
+            )
             log.warning(
                 "synthesized Stop hook JSON fallback at stream end context=%s chars=%s",
                 request_context,
