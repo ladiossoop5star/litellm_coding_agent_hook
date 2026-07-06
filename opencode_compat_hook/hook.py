@@ -32,6 +32,7 @@ REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_KEEPALIVE_SECONDS = 5.0
 STOP_HOOK_JSON_FALLBACK_SECONDS = 28.0
 STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
+STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
 COUNT_TOKENS_NATIVE_MAX_ESTIMATE = 8192
 _RESPONSES_EMPTY_TOOLS_PATCHED = False
 _RESPONSES_REASONING_TEXT_PATCHED = False
@@ -1202,15 +1203,51 @@ def _mutate_stop_hook_fallback_counts(mutator: Any) -> Any:
         return mutator(_STOP_HOOK_JSON_FALLBACK_COUNTS)
 
 
-def _stop_hook_json_fallback_available(session_key: str, request_context: str) -> bool:
-    def mutate(counts: Dict[str, Any]) -> Tuple[bool, int]:
-        count = int(counts.get(session_key) or 0)
-        if count < STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE:
-            return True, count
-        counts.pop(session_key, None)
-        return False, count
+def _stop_hook_fallback_entry(value: Any) -> Tuple[int, Optional[float]]:
+    if isinstance(value, dict):
+        try:
+            count = int(value.get("count") or 0)
+        except Exception:
+            count = 0
+        updated_at = value.get("updated_at")
+        if isinstance(updated_at, (int, float)):
+            return count, float(updated_at)
+        return count, None
+    try:
+        return int(value or 0), None
+    except Exception:
+        return 0, None
 
-    available, count = _mutate_stop_hook_fallback_counts(mutate)
+
+def _stop_hook_fallback_entry_expired(updated_at: Optional[float], now: float) -> bool:
+    return updated_at is not None and now - updated_at > STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS
+
+
+def _set_stop_hook_fallback_entry(counts: Dict[str, Any], session_key: str, count: int, now: float) -> None:
+    counts[session_key] = {"count": count, "updated_at": now}
+
+
+def _stop_hook_json_fallback_available(session_key: str, request_context: str) -> bool:
+    now = time.time()
+
+    def mutate(counts: Dict[str, Any]) -> Tuple[bool, int, bool]:
+        count, updated_at = _stop_hook_fallback_entry(counts.get(session_key))
+        if _stop_hook_fallback_entry_expired(updated_at, now):
+            counts.pop(session_key, None)
+            return True, 0, True
+        if count < STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE:
+            return True, count, False
+        counts.pop(session_key, None)
+        return False, count, False
+
+    available, count, idle_reset = _mutate_stop_hook_fallback_counts(mutate)
+    if idle_reset:
+        log.info(
+            "Stop hook JSON fallback counter reset after %.0fs idle session=%s context=%s",
+            STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS,
+            session_key,
+            request_context,
+        )
     if available:
         return True
     log.warning(
@@ -1223,9 +1260,14 @@ def _stop_hook_json_fallback_available(session_key: str, request_context: str) -
 
 
 def _record_stop_hook_json_fallback(session_key: str, request_context: str, reason: str) -> None:
+    now = time.time()
+
     def mutate(counts: Dict[str, Any]) -> int:
-        count = int(counts.get(session_key) or 0) + 1
-        counts[session_key] = count
+        count, updated_at = _stop_hook_fallback_entry(counts.get(session_key))
+        if _stop_hook_fallback_entry_expired(updated_at, now):
+            count = 0
+        count += 1
+        _set_stop_hook_fallback_entry(counts, session_key, count, now)
         return count
 
     count = _mutate_stop_hook_fallback_counts(mutate)
@@ -1241,7 +1283,7 @@ def _record_stop_hook_json_fallback(session_key: str, request_context: str, reas
 
 def _record_stop_hook_valid_json(session_key: str, request_context: str) -> None:
     def mutate(counts: Dict[str, Any]) -> int:
-        previous = int(counts.pop(session_key, 0) or 0)
+        previous, _ = _stop_hook_fallback_entry(counts.pop(session_key, 0))
         return previous
 
     previous = _mutate_stop_hook_fallback_counts(mutate)
