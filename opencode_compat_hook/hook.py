@@ -37,6 +37,7 @@ _RESPONSES_EMPTY_TOOLS_PATCHED = False
 _RESPONSES_REASONING_TEXT_PATCHED = False
 _STOP_HOOK_JSON_FALLBACK_COUNTS_PATH = "/tmp/opencode_compat_stop_hook_fallback_counts.json"
 _STOP_HOOK_JSON_FALLBACK_COUNTS: Dict[str, int] = {}
+_STOP_HOOK_REQUEST_STARTED_AT: Dict[str, float] = {}
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -1088,6 +1089,10 @@ def _stop_hook_session_key(request_data: Optional[dict], request_context: str) -
     return request_context
 
 
+def _stop_hook_request_key(session_key: str) -> str:
+    return session_key
+
+
 def _iter_nested_strings(value: Any) -> Iterable[str]:
     if isinstance(value, str):
         yield value
@@ -1668,6 +1673,12 @@ class OpencodeCompatHandler(CustomLogger):
 
         _sanitize_chat_internal_artifact_history(data)
         _normalize_assistant_messages(data.get("messages"))
+        request_probe = dict(data)
+        request_probe["call_type"] = call_type
+        if _is_stop_hook_json_evaluator(request_probe):
+            request_context = _request_context(request_probe)
+            session_key = _stop_hook_session_key(request_probe, request_context)
+            _STOP_HOOK_REQUEST_STARTED_AT[_stop_hook_request_key(session_key)] = time.time()
         return data
 
     async def async_pre_request_hook(self, model: str, messages: List[Any], kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1880,6 +1891,9 @@ class OpencodeCompatHandler(CustomLogger):
         stop_hook_visible_text = False
         stop_hook_text_buffer = ""
         stop_hook_started_at = time.time()
+        if stop_hook_json_evaluator:
+            started_key = _stop_hook_request_key(stop_hook_session_key)
+            stop_hook_started_at = _STOP_HOOK_REQUEST_STARTED_AT.pop(started_key, stop_hook_started_at)
         openai_sse_mode = False
 
         keepalive_seconds = STOP_HOOK_KEEPALIVE_SECONDS if stop_hook_json_evaluator else MESSAGES_STREAM_KEEPALIVE_SECONDS
