@@ -92,6 +92,11 @@ def _patch_tool_call_ids(delta: Any) -> None:
         tid = _get(tc, "id", None)
         if not tid:
             _set(tc, "id", "call_" + uuid.uuid4().hex)
+        fn = _get(tc, "function", None)
+        if fn is not None:
+            fname = _get(fn, "name", None)
+            if not fname:
+                _set(fn, "name", "unknown")
 
 
 def _chunk_model(chunk: Any, fallback: str = "unknown") -> str:
