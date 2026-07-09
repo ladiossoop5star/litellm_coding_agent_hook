@@ -84,6 +84,16 @@ def _chunk_id(chunk: Any, fallback: str = "chatcmpl-opencode-compat") -> str:
     return _get(chunk, "id", None) or fallback
 
 
+def _patch_tool_call_ids(delta: Any) -> None:
+    tool_calls = _get(delta, "tool_calls", None)
+    if not tool_calls:
+        return
+    for tc in tool_calls:
+        tid = _get(tc, "id", None)
+        if not tid:
+            _set(tc, "id", "call_" + uuid.uuid4().hex)
+
+
 def _chunk_model(chunk: Any, fallback: str = "unknown") -> str:
     return _get(chunk, "model", None) or fallback
 
@@ -815,6 +825,37 @@ def _patch_litellm_responses_reasoning_text_bridge() -> None:
         log.warning("failed to patch LiteLLM Responses reasoning_text bridge: %s", exc)
 
 
+_CLIENT_DISCONNECT_METADATA_PATCHED = False
+
+
+def _patch_litellm_client_disconnect_metadata() -> None:
+    global _CLIENT_DISCONNECT_METADATA_PATCHED
+
+    if _CLIENT_DISCONNECT_METADATA_PATCHED:
+        return
+
+    try:
+        from litellm.proxy import common_request_processing as _crp
+
+        original = _crp._apply_client_disconnect_metadata
+        if getattr(original, "_opencode_disconnect_patched", False):
+            _CLIENT_DISCONNECT_METADATA_PATCHED = True
+            return
+
+        def _safe_apply_disconnect(target_metadata: Any) -> None:
+            if not isinstance(target_metadata, dict):
+                return
+            target_metadata["client_disconnected"] = True
+            target_metadata["error_information"] = dict(_crp._CLIENT_DISCONNECTED_ERROR_INFORMATION)
+
+        setattr(_safe_apply_disconnect, "_opencode_disconnect_patched", True)
+        _crp._apply_client_disconnect_metadata = _safe_apply_disconnect
+        _CLIENT_DISCONNECT_METADATA_PATCHED = True
+        log.info("patched LiteLLM _apply_client_disconnect_metadata to handle None metadata")
+    except Exception as exc:
+        log.warning("failed to patch LiteLLM client disconnect metadata: %s", exc)
+
+
 def _encode_like(text: str, original: Any) -> Any:
     if isinstance(original, (bytes, bytearray)):
         return text.encode("utf-8")
@@ -940,7 +981,7 @@ def _first_complete_openai_tool_call(
 
         if entry["name"] and _is_complete_json_object(entry["arguments"]):
             return {
-                "id": entry["id"],
+                "id": entry["id"] or "call_" + uuid.uuid4().hex,
                 "type": "function",
                 "function": {
                     "name": entry["name"],
@@ -1595,6 +1636,7 @@ class OpencodeCompatHandler(CustomLogger):
     def __init__(self) -> None:
         _patch_litellm_responses_empty_tools_bridge()
         _patch_litellm_responses_reasoning_text_bridge()
+        _patch_litellm_client_disconnect_metadata()
         self._register_input_tokens_route()
         self._register_messages_count_tokens_route()
 
@@ -1797,6 +1839,7 @@ class OpencodeCompatHandler(CustomLogger):
             last_created = _chunk_created(chunk, last_created)
 
             delta = _delta(chunk)
+            _patch_tool_call_ids(delta)
             if _get(delta, "role", None):
                 yield chunk
                 continue
