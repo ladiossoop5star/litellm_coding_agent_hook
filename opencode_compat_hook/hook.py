@@ -1758,8 +1758,18 @@ class OpencodeCompatHandler(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
         _sanitize_request_tools(data, call_type)
         if call_type == "anthropic_messages":
-            if isinstance(data.get("thinking"), dict) and data["thinking"].get("type") == "enabled":
+            thinking = data.get("thinking")
+            if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+                budget = thinking.get("budget_tokens")
+                if isinstance(budget, int) and budget >= 10000:
+                    data["reasoning_effort"] = "high"
+                elif isinstance(budget, int) and budget >= 5000:
+                    data["reasoning_effort"] = "medium"
+                else:
+                    data["reasoning_effort"] = "low"
                 data.pop("thinking", None)
+            if data.get("stream") is None:
+                data["stream"] = True
         if call_type in ("responses", "aresponses"):
             _disable_responses_reasoning_merge(data)
             _sanitize_response_input_history(data)
