@@ -20,6 +20,11 @@ from opencode_compat_hook.parser import (
 
 
 log = logging.getLogger("opencode_compat_hook")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s - opencode_compat_hook - %(levelname)s - %(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
 
 SECTION_SIZE = 32
 GUARD_SECTIONS = 2
@@ -1752,6 +1757,9 @@ class OpencodeCompatHandler(CustomLogger):
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
         _sanitize_request_tools(data, call_type)
+        if call_type == "anthropic_messages":
+            if isinstance(data.get("thinking"), dict) and data["thinking"].get("type") == "enabled":
+                data.pop("thinking", None)
         if call_type in ("responses", "aresponses"):
             _disable_responses_reasoning_merge(data)
             _sanitize_response_input_history(data)
