@@ -1,0 +1,51 @@
+# =========================================================================
+# ⚠️ DEPLOYMENT & ENVIRONMENT WORKFLOW POLICY
+# =========================================================================
+
+model_list:
+  - model_name: model-1
+    litellm_params:
+      model: openai/model-1
+      api_base: http://10.1.1.1:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 320000
+      max_input_tokens: 287232
+      max_output_tokens: 32768
+
+  - model_name: model-2
+    litellm_params:
+      model: openai/model-2
+      api_base: http://10.1.1.2:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 500000
+      max_input_tokens: 467232
+      max_output_tokens: 32768
+
+router_settings:
+  model_group_alias:
+    claude-haiku-4-5-20251001: model-1
+    claude-sonnet-4-6: model-1
+    claude-opus-4-6: model-2
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  callbacks:
+    - opencode_compat_hook.hook.proxy_handler_instance
+  drop_params: true
+  set_content_as_str: true
+  set_verbose: false
+  use_chat_completions_url_for_anthropic_messages: true
