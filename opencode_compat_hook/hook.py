@@ -89,19 +89,39 @@ def _chunk_id(chunk: Any, fallback: str = "chatcmpl-opencode-compat") -> str:
     return _get(chunk, "id", None) or fallback
 
 
-def _patch_tool_call_ids(delta: Any) -> None:
+def _patch_tool_call_ids(delta: Any, state: Dict[Any, Dict[str, str]]) -> None:
     tool_calls = _get(delta, "tool_calls", None)
     if not tool_calls:
         return
-    for tc in tool_calls:
+
+    for position, tc in enumerate(tool_calls):
+        index = _get(tc, "index", None)
+        state_key = index if index is not None else position
         tid = _get(tc, "id", None)
-        if not tid:
-            _set(tc, "id", "call_" + uuid.uuid4().hex)
         fn = _get(tc, "function", None)
-        if fn is not None:
-            fname = _get(fn, "name", None)
-            if not fname:
-                _set(fn, "name", "unknown")
+        name = _get(fn, "name", None) if fn is not None else None
+        entry = state.get(state_key)
+
+        if tid and (entry is None or entry.get("id") != tid):
+            entry = {"id": str(tid)}
+            state[state_key] = entry
+
+        if not tid:
+            if entry and entry.get("id"):
+                _set(tc, "id", entry["id"])
+            else:
+                tid = "call_" + uuid.uuid4().hex
+                _set(tc, "id", tid)
+                entry = {"id": tid}
+                state[state_key] = entry
+
+        if isinstance(name, str) and name:
+            if entry is None:
+                entry = {"id": str(_get(tc, "id", ""))}
+                state[state_key] = entry
+            entry["name"] = name
+        elif fn is not None and entry and entry.get("name"):
+            _set(fn, "name", entry["name"])
 
 
 def _chunk_model(chunk: Any, fallback: str = "unknown") -> str:
@@ -989,7 +1009,12 @@ def _first_complete_openai_tool_call(
         if isinstance(arguments, str):
             entry["arguments"] += arguments
 
+        log.info("openai_tool_delta index=%s id=%s name=%r args_preview=%s",
+                 index, _get(tool_call, "id", None),
+                 name, str(arguments or "")[:200])
+
         if entry["name"] and _is_complete_json_object(entry["arguments"]):
+            log.info("openai_tool_completed name=%r args=%s", entry["name"], entry["arguments"][:200])
             return {
                 "id": entry["id"] or "call_" + uuid.uuid4().hex,
                 "type": "function",
@@ -1494,6 +1519,7 @@ def _messages_tool_use_events(tool_calls: Iterable[Dict[str, Any]], start_index:
         fn = tc["function"]
         tool_id = "toolu_" + uuid.uuid4().hex[:24]
         args = fn.get("arguments") or "{}"
+        log.info("emitting_tool_use name=%r tool_id=%s args_preview=%s", fn["name"], tool_id, str(args)[:200])
         events.append(
             _sse(
                 "content_block_start",
@@ -1832,6 +1858,7 @@ class OpencodeCompatHandler(CustomLogger):
         last_id = "chatcmpl-opencode-compat"
         last_model = request_data.get("model", "unknown") if request_data else "unknown"
         last_created = int(time.time())
+        tool_call_state: Dict[Any, Dict[str, str]] = {}
 
         async for chunk in response:
             # Native passthrough streams can be bytes; leave them untouched.
@@ -1862,7 +1889,7 @@ class OpencodeCompatHandler(CustomLogger):
             last_created = _chunk_created(chunk, last_created)
 
             delta = _delta(chunk)
-            _patch_tool_call_ids(delta)
+            _patch_tool_call_ids(delta, tool_call_state)
             if _get(delta, "role", None):
                 yield chunk
                 continue
@@ -2538,6 +2565,9 @@ class OpencodeCompatHandler(CustomLogger):
 
             parsed = parse_raw_tool_calls(normalize_raw_tool_calls(text_buffer))
             if parsed:
+                for p in parsed:
+                    pf = p.get("function", {})
+                    log.info("parsed_raw_tool name=%r args_preview=%s", pf.get("name"), str(pf.get("arguments", ""))[:200])
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index}, original)
                 for event in _messages_tool_use_events(parsed, text_block_index + 1, original):
                     yield event
