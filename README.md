@@ -89,6 +89,8 @@ Converts non-standard tool-call formats into standard OpenAI `tool_calls` or Ant
 
 Works in both **streaming** and **non-streaming** modes.
 
+**Non-streaming support**: For non-streaming responses (`async_post_call_success_hook`), the hook scans the response content for complete raw tool blocks and converts them to standard `tool_calls`, setting `finish_reason` to `"tool_calls"`. Anthropic-style responses (dict with `content` list) are handled separately via `_convert_anthropic_message_response()`, which extracts raw tool blocks from `text` or `thinking` blocks and inserts `tool_use` entries into the content array.
+
 ### GLM-5.2 Streaming Tool Call Fixes
 
 GLM-5.2 exhibits two specific streaming behavior issues that break coding agents:
@@ -101,13 +103,28 @@ GLM-5.2 exhibits two specific streaming behavior issues that break coding agents
 
 - Suppresses `<think>...</think>` blocks from stream output
 - Automatically reveals hidden thinking after 30 seconds if the block never closes
-- Logs suppression statistics (chars, chunks, preview)
-- Raises an error if an unclosed `<think>` block results in an empty assistant turn
+- Logs suppression statistics (chars, chunks, preview up to 200 chars)
+- If a `<think>` block closes cleanly and the response has visible content, it is left undisturbed
+- Raises a `RuntimeError` if an unclosed `<think>` block results in an entirely empty assistant turn (no text, no tool calls)
 - Reveals thinking content that contains tool-call prefixes as hidden thinking fallback
 
 ### First-Native-Tool Stop
 
 For DeepSeek models and Anthropic Messages streams, automatically stops the stream as soon as the first complete native tool call is detected. Prevents the model from generating additional, often spurious, tool calls after the intended one.
+
+### Anthropic Messages API Stream Conversion
+
+When a coding agent sends requests through the `/v1/messages` endpoint, the underlying model may only support the OpenAI chat completion format. This hook bridges the gap by converting OpenAI-style delta chunks into Anthropic SSE events:
+
+```
+message_start → content_block_start → content_block_delta
+→ content_block_stop → message_delta → message_stop
+```
+
+- Supports both `text_delta` and `thinking_delta` content types
+- Synthesizes complete `tool_use` content blocks (with id, name, and input) from parsed raw tool calls
+- Handles OpenAI SSE mode (`data: {...}`) transparently within the Messages stream
+- Estimated input tokens are injected into the `message_start` event when the upstream model does not provide them
 
 ### Stop Hook JSON Evaluator Fallback
 
@@ -123,16 +140,18 @@ When a request contains a Stop hook evaluator (matching `hook_event_name: Stop` 
 
 - **Empty tools patching**: Removes empty `tools` arrays from Responses API → chat completion conversions
 - **Reasoning text preservation**: Maps `response.reasoning_text.delta` events to `reasoning_content` in the OpenAI stream
+- **Disable reasoning merge**: Sets `merge_reasoning_content_in_choices = False` to prevent litellm from folding reasoning into content, which would interfere with raw tool call detection
 - **Input history sanitization**: Strips raw `<think>` tags from assistant history in Responses API input
-- **Malformed function call cleanup**: Removes `function_call` entries with non-JSON `arguments` and their corresponding `function_call_output` entries.
-- **Compaction detection**: Disables tools for Codex compaction requests
+- **Malformed function call cleanup**: Removes `function_call` entries with non-JSON `arguments` and their corresponding `function_call_output` entries
+- **Stream passthrough**: Skips DSML conversion for `responses`/`aresponses`/`pass_through_endpoint` call types, letting native stream chunks pass through unchanged
+- **Compaction detection**: Disables tools for Codex compaction requests (identified by `x-codex-turn-metadata` or `CONTEXT CHECKPOINT COMPACTION` marker)
 
 ### Request Pre-Processing
 
 - **Tool format normalization**: Converts Responses API tool format (`name`/`description`/`parameters`) to chat completion function-calling format
 - **Tool type filtering**: Strips non-function tools, drops empty tool arrays
-- **Assistant message padding**: Inserts placeholder content (`"."`) in empty assistant messages, preventing model errors
-- **Internal artifact stripping**: Removes `<system-reminder>`, DSML-compression, and other internal artifacts from message history
+- **Assistant message padding**: Inserts placeholder content (`"."`) in empty assistant messages, preventing model errors. For structured content arrays, adds `{"type": "text", "text": "."}` when the array is empty or has no text/tool_use blocks
+- **Internal artifact stripping**: Removes `<system-reminder>`, DSML-compression, and other internal artifacts (including `｜DSML｜` and `\|DSML\|` variants) from message history
 - **Thinking-to-reasoning mapping**: Translates Anthropic `thinking.budget_tokens` to `reasoning_effort` (high/medium/low)
 - **Forced streaming**: Automatically enables streaming for Anthropic Messages calls
 
@@ -141,7 +160,14 @@ When a request contains a Stop hook evaluator (matching `hook_event_name: Stop` 
 | Route | Purpose |
 |---|---|
 | `POST /v1/responses/input_tokens` | Estimates input tokens by character count |
-| `POST /v1/messages/count_tokens` | Delegates to native endpoint, falls back to local estimation |
+| `POST /v1/messages/count_tokens` | Delegates to native endpoint, falls back to local estimation (CJK-aware, includes message/tool overhead) |
+
+### Built-in Token Estimator
+
+Used when the upstream model does not provide token counts. The estimator accounts for:
+- **CJK characters** (1 token each) vs. **other characters** (1 token per 4 characters)
+- **Message framing overhead**: 128 base + 12 per message + 24 per tool
+- **Safety margin**: 10% buffer on all estimates
 
 ### Stream Keepalive
 
