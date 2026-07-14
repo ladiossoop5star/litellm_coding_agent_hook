@@ -64,6 +64,16 @@ services:
 
 將 agent 指向 LiteLLM proxy，hook 會透明處理所有問題。
 
+## 測試過的組合
+
+此 hook 搭配提供的 `config.yaml`，已在以下 coding agent 與模型組合上測試通過：
+
+| Agent | 模型 |
+|---|---|
+| OpenCode | Qwen 3.6 27B、DeepSeek V4 Flash DSpark、GLM-5.2 |
+| Codex CLI | Qwen 3.6 27B、DeepSeek V4 Flash DSpark、GLM-5.2 |
+| Claude Code | Qwen 3.6 27B、DeepSeek V4 Flash DSpark、GLM-5.2 |
+
 ## 功能列表
 
 ### 原始工具呼叫格式轉換

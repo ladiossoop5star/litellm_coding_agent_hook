@@ -64,6 +64,16 @@ services:
 
 Point the agent to the LiteLLM proxy. The hook handles everything transparently.
 
+## Tested With
+
+This hook, together with the provided `config.yaml`, has been tested with the following coding agents and models:
+
+| Agent | Model |
+|---|---|
+| OpenCode | Qwen 3.6 27B, DeepSeek V4 Flash DSpark, GLM-5.2 |
+| Codex CLI | Qwen 3.6 27B, DeepSeek V4 Flash DSpark, GLM-5.2 |
+| Claude Code | Qwen 3.6 27B, DeepSeek V4 Flash DSpark, GLM-5.2 |
+
 ## Features
 
 ### Raw Tool-Call Format Conversion
