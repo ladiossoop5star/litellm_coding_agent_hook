@@ -11,6 +11,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.types.utils import ModelResponseStream
 
 from opencode_compat_hook.parser import (
+    RAW_TOOL_OPEN_MARKERS,
     find_raw_tool_start,
     has_any_dsml_prefix,
     has_complete_raw_tool_block,
@@ -1445,6 +1446,16 @@ def _matching_prefix_suffix(text: str, marker: str) -> str:
     return ""
 
 
+def _matching_raw_tool_prefix_suffix(text: str) -> str:
+    matches = [_matching_prefix_suffix(text, marker) for marker in RAW_TOOL_OPEN_MARKERS]
+    return max(matches, key=len, default="")
+
+
+def _first_raw_tool_open_index(text: str) -> int:
+    indexes = [idx for marker in RAW_TOOL_OPEN_MARKERS if (idx := text.find(marker)) != -1]
+    return min(indexes) if indexes else -1
+
+
 def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
     """Drop raw <think>...</think> text from model deltas, including split markers."""
     if not text:
@@ -1459,8 +1470,26 @@ def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
     while data:
         if state.get("in_think"):
             close_idx = data.find(close_marker)
+            tool_idx = _first_raw_tool_open_index(data)
+            if tool_idx != -1 and (close_idx == -1 or tool_idx < close_idx):
+                hidden_segment = data[:tool_idx]
+                if _should_reveal_hidden_thinking(state):
+                    state["_revealed_delta"] = True
+                    output.append(_hidden_thinking_reveal_prefix(state))
+                    output.append(hidden_segment)
+                else:
+                    _record_raw_think_suppressed(hidden_segment, state)
+                state["in_think"] = False
+                state["implicit_tool_boundary"] = True
+                output.append(data[tool_idx:])
+                visible = "".join(output)
+                state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
+                return visible
+
             if close_idx == -1:
-                tail = _matching_prefix_suffix(data, close_marker)
+                close_tail = _matching_prefix_suffix(data, close_marker)
+                tool_tail = _matching_raw_tool_prefix_suffix(data)
+                tail = max((close_tail, tool_tail), key=len)
                 hidden_segment = data[:-len(tail)] if tail else data
                 if _should_reveal_hidden_thinking(state):
                     state["_revealed_delta"] = True
@@ -1554,6 +1583,70 @@ def _messages_tool_use_events(tool_calls: Iterable[Dict[str, Any]], start_index:
     )
     events.append(_sse("message_stop", {"type": "message_stop"}, original))
     return events
+
+
+def _request_tool_schemas(request_data: Optional[dict]) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(request_data, dict):
+        return {}
+
+    tools = request_data.get("tools")
+    if not isinstance(tools, list):
+        optional_params = request_data.get("optional_params")
+        tools = optional_params.get("tools") if isinstance(optional_params, dict) else None
+    if not isinstance(tools, list):
+        return {}
+
+    schemas: Dict[str, Dict[str, Any]] = {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            schema = function.get("parameters")
+        else:
+            name = tool.get("name")
+            schema = tool.get("input_schema")
+        if isinstance(name, str) and name:
+            schemas[name] = schema if isinstance(schema, dict) else {"type": "object"}
+    return schemas
+
+
+def _validate_implicit_tool_calls(
+    tool_calls: Iterable[Dict[str, Any]], tool_schemas: Dict[str, Dict[str, Any]]
+) -> Tuple[bool, str]:
+    if not tool_schemas:
+        return False, "the request did not provide any callable tools"
+
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError:
+        Draft202012Validator = None  # type: ignore[assignment,misc]
+
+    for tool_call in tool_calls:
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            return False, "the recovered tool call has no function object"
+        name = function.get("name")
+        if not isinstance(name, str) or name not in tool_schemas:
+            return False, f"tool {name!r} was not offered in this request"
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            return False, f"tool {name!r} arguments are not JSON text"
+        try:
+            parsed_arguments = json.loads(arguments)
+        except (TypeError, ValueError) as exc:
+            return False, f"tool {name!r} arguments are invalid JSON: {exc}"
+        if not isinstance(parsed_arguments, dict):
+            return False, f"tool {name!r} arguments must decode to an object"
+        if Draft202012Validator is not None:
+            errors = sorted(
+                Draft202012Validator(tool_schemas[name]).iter_errors(parsed_arguments),
+                key=lambda error: list(error.path),
+            )
+            if errors:
+                return False, f"tool {name!r} arguments fail schema validation: {errors[0].message}"
+    return True, ""
 
 
 def _messages_end_turn_events(index: int, original: Any) -> List[Any]:
@@ -2010,6 +2103,7 @@ class OpencodeCompatHandler(CustomLogger):
         text_block_index = 0
         text_delta_type = "text_delta"
         raw_think = _raw_think_state()
+        raw_think["tool_schemas"] = _request_tool_schemas(request_data)
         native_tool_index: Optional[int] = None
         native_tool_json = ""
         passthrough_blocked = False
@@ -2558,18 +2652,62 @@ class OpencodeCompatHandler(CustomLogger):
         previous_text_len = len(text_buffer)
         text_buffer += safe_text
 
-        if not revealed_hidden_delta and has_complete_raw_tool_block(text_buffer):
+        implicit_tool_candidate = bool(raw_think.get("implicit_tool_boundary"))
+        if (
+            (not revealed_hidden_delta or implicit_tool_candidate)
+            and has_complete_raw_tool_block(text_buffer)
+        ):
             idx = find_raw_tool_start(text_buffer)
             if idx > 0 and not dsml_mode:
                 yield _messages_text_delta(text_buffer[:idx], text_block_index, original, delta_type)
 
             parsed = parse_raw_tool_calls(normalize_raw_tool_calls(text_buffer))
+            implicit_tool_boundary = bool(raw_think.pop("implicit_tool_boundary", False))
+            validation_error = ""
+            if parsed and implicit_tool_boundary:
+                valid, validation_error = _validate_implicit_tool_calls(
+                    parsed, raw_think.get("tool_schemas") or {}
+                )
+                if not valid:
+                    parsed = []
             if parsed:
                 for p in parsed:
                     pf = p.get("function", {})
-                    log.info("parsed_raw_tool name=%r args_preview=%s", pf.get("name"), str(pf.get("arguments", ""))[:200])
+                    log.info(
+                        "parsed_raw_tool name=%r implicit_think_close=%s args_preview=%s",
+                        pf.get("name"),
+                        implicit_tool_boundary,
+                        str(pf.get("arguments", ""))[:200],
+                    )
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index}, original)
                 for event in _messages_tool_use_events(parsed, text_block_index + 1, original):
+                    yield event
+                yield {
+                    "_state": True,
+                    "text_buffer": "",
+                    "unflushed_text": "",
+                    "pending": [],
+                    "dsml_mode": True,
+                    "raw_think": raw_think,
+                    "passthrough_blocked": True,
+                    "stop_sent": True,
+                }
+                return
+
+            if implicit_tool_boundary and validation_error:
+                log.warning(
+                    "rejecting implicit-think tool recovery reason=%s preview=%r",
+                    validation_error,
+                    text_buffer[idx:idx + 800].replace("\n", "\\n"),
+                )
+                yield _messages_text_delta(
+                    "model output malformed: a tool call inside unclosed reasoning "
+                    f"was rejected ({validation_error}). Retry this step.",
+                    text_block_index,
+                    original,
+                    delta_type,
+                )
+                for event in _messages_end_turn_events(text_block_index, original):
                     yield event
                 yield {
                     "_state": True,
