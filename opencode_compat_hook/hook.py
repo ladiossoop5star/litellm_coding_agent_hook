@@ -36,7 +36,7 @@ MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
 MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_KEEPALIVE_SECONDS = 5.0
-STOP_HOOK_JSON_FALLBACK_SECONDS = 28.0
+STOP_HOOK_JSON_FALLBACK_SECONDS = 25.0
 STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
 STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
 COUNT_TOKENS_NATIVE_MAX_ESTIMATE = 8192
@@ -2253,7 +2253,46 @@ class OpencodeCompatHandler(CustomLogger):
                         if stop_hook_json_evaluator:
                             stop_hook_text_buffer += chunk_text
                             if _is_valid_stop_hook_json_text(stop_hook_text_buffer):
+                                stop_hook_visible_text = True
+                                for event in _messages_text_end_turn_events(
+                                    stop_hook_text_buffer,
+                                    text_block_index,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
                                 _record_stop_hook_valid_json(stop_hook_session_key, request_context)
+                                log.info(
+                                    "emitted buffered valid Stop hook JSON context=%s",
+                                    request_context,
+                                )
+                                return
+                            if (
+                                time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                                and _stop_hook_json_fallback_available(
+                                    stop_hook_session_key, request_context
+                                )
+                            ):
+                                for event in _messages_text_end_turn_events(
+                                    _stop_hook_json_fallback_text(),
+                                    text_block_index,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_json_fallback(
+                                    stop_hook_session_key,
+                                    request_context,
+                                    "invalid-buffered-openai-text",
+                                )
+                                log.warning(
+                                    "synthesized Stop hook JSON fallback after invalid "
+                                    "buffered OpenAI text context=%s chars=%s",
+                                    request_context,
+                                    len(stop_hook_text_buffer),
+                                )
+                                return
+                            continue
                         if not saw_content_block:
                             yield _sse(
                                 "content_block_start",
@@ -2367,11 +2406,53 @@ class OpencodeCompatHandler(CustomLogger):
                                 )
                                 return
                             continue
-                        if stop_hook_json_evaluator and delta_type == "text_delta" and delta[delta_field].strip():
-                            stop_hook_visible_text = True
+                        if (
+                            stop_hook_json_evaluator
+                            and delta_type == "text_delta"
+                            and delta[delta_field]
+                        ):
                             stop_hook_text_buffer += delta[delta_field]
                             if _is_valid_stop_hook_json_text(stop_hook_text_buffer):
+                                stop_hook_visible_text = True
+                                for event in _messages_text_end_turn_events(
+                                    stop_hook_text_buffer,
+                                    text_block_index,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
                                 _record_stop_hook_valid_json(stop_hook_session_key, request_context)
+                                log.info(
+                                    "emitted buffered valid Stop hook JSON context=%s",
+                                    request_context,
+                                )
+                                return
+                            if (
+                                time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                                and _stop_hook_json_fallback_available(
+                                    stop_hook_session_key, request_context
+                                )
+                            ):
+                                for event in _messages_text_end_turn_events(
+                                    _stop_hook_json_fallback_text(),
+                                    text_block_index,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_json_fallback(
+                                    stop_hook_session_key,
+                                    request_context,
+                                    "invalid-buffered-anthropic-text",
+                                )
+                                log.warning(
+                                    "synthesized Stop hook JSON fallback after invalid "
+                                    "buffered Anthropic text context=%s chars=%s",
+                                    request_context,
+                                    len(stop_hook_text_buffer),
+                                )
+                                return
+                            continue
                         async for item in self._handle_messages_text_delta(
                             delta[delta_field],
                             text_block_index,
@@ -2455,6 +2536,54 @@ class OpencodeCompatHandler(CustomLogger):
                     text_buffer = ""
 
                 if event_name == "message_start":
+                    if saw_message_start:
+                        tail = _flush_raw_think_tail(raw_think)
+                        if tail:
+                            unflushed_text += tail
+                        fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+                        if fallback:
+                            unflushed_text += fallback
+                        if raw_think.get("in_think"):
+                            _warn_unclosed_raw_think(raw_think, request_context)
+                        for item in pending:
+                            yield _messages_text_delta(
+                                item,
+                                text_block_index,
+                                chunk,
+                                text_delta_type,
+                            )
+                        if unflushed_text:
+                            yield _messages_text_delta(
+                                unflushed_text,
+                                text_block_index,
+                                chunk,
+                                text_delta_type,
+                            )
+                        for index in sorted(open_content_blocks):
+                            yield _sse(
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": index},
+                                chunk,
+                            )
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {
+                                    "stop_reason": "end_turn",
+                                    "stop_sequence": None,
+                                },
+                                "usage": {"output_tokens": 0},
+                            },
+                            chunk,
+                        )
+                        yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                        log.warning(
+                            "terminated messages stream before duplicate message_start "
+                            "from transparent upstream retry context=%s",
+                            request_context,
+                        )
+                        return
                     saw_message_start = True
                     yield _sse(
                         event_name,

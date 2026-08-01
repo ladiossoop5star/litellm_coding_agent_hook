@@ -19,3 +19,5 @@ services:
       - "4000"
       - "--num_workers"
       - "2"
+      - "--timeout_worker_healthcheck"
+      - "60"
