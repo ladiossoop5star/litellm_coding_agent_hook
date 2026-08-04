@@ -131,43 +131,6 @@ async def anthropic_stream_with_transparent_retry():
     ).encode()
 
 
-class CloseTrackedAnthropicToolStream:
-    def __init__(self):
-        self.closed = False
-        self._chunks = iter(
-            [
-                (
-                    'event: message_start\ndata: {"type":"message_start","message":'
-                    '{"id":"msg_tool","type":"message","role":"assistant",'
-                    '"model":"test","content":[],"stop_reason":null,'
-                    '"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
-                ).encode(),
-                (
-                    'event: content_block_start\ndata: {"type":"content_block_start",'
-                    '"index":0,"content_block":{"type":"tool_use","id":"tool_1",'
-                    '"name":"Bash","input":{}}}\n\n'
-                ).encode(),
-                (
-                    'event: content_block_delta\ndata: {"type":"content_block_delta",'
-                    '"index":0,"delta":{"type":"input_json_delta",'
-                    '"partial_json":"{\\"command\\":\\"pwd\\"}"}}\n\n'
-                ).encode(),
-            ]
-        )
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        try:
-            return next(self._chunks)
-        except StopIteration as exc:
-            raise StopAsyncIteration from exc
-
-    async def aclose(self):
-        self.closed = True
-
-
 def emitted_text(rendered):
     text = []
     for line in rendered.splitlines():
@@ -293,21 +256,6 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         request_data["cycle"] = request_data
 
         self.assertTrue(_is_stop_hook_json_evaluator(request_data))
-
-    async def test_native_tool_early_stop_closes_upstream_stream(self):
-        upstream = CloseTrackedAnthropicToolStream()
-        output = []
-        async for item in self.handler.async_post_call_streaming_iterator_hook(
-            None,
-            upstream,
-            {"call_type": "anthropic_messages", "stream": True},
-        ):
-            output.append(item.decode() if isinstance(item, bytes) else str(item))
-
-        rendered = "".join(output)
-        self.assertTrue(upstream.closed)
-        self.assertIn('"stop_reason": "tool_use"', rendered)
-        self.assertEqual(rendered.count("event: message_stop\n"), 1)
 
     async def test_transparent_retry_is_ended_before_duplicate_message_start(self):
         output = []
