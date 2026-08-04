@@ -37,6 +37,7 @@ MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_KEEPALIVE_SECONDS = 5.0
 STOP_HOOK_JSON_FALLBACK_SECONDS = 25.0
+NESTED_REQUEST_SCAN_MAX_DEPTH = 64
 STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
 STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
 COUNT_TOKENS_NATIVE_MAX_ESTIMATE = 8192
@@ -959,16 +960,38 @@ async def _iter_with_keepalive(
 
             original_for_output = chunk
             last_chunk_at = time.time()
-            next_chunk = asyncio.create_task(iterator.__anext__())
             yield chunk
+            # Do not prefetch while the consumer handles the current chunk. The
+            # messages converter can intentionally stop as soon as a complete
+            # tool call arrives; prefetching here leaves another __anext__ task
+            # consuming the upstream stream after the downstream response ends.
+            next_chunk = asyncio.create_task(iterator.__anext__())
     finally:
         if not next_chunk.done():
             next_chunk.cancel()
-        elif not next_chunk.cancelled():
-            try:
-                next_chunk.exception()
-            except Exception:
-                pass
+        try:
+            await next_chunk
+        except BaseException:
+            pass
+
+
+async def _close_async_stream(stream: Any, request_context: str) -> None:
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if result is not None:
+            await result
+    except BaseException as exc:
+        # Cleanup must never replace the valid tool response already delivered
+        # to the coding agent, but retain a diagnostic if a provider cannot be
+        # closed cleanly.
+        log.warning(
+            "failed to close upstream messages stream context=%s error=%s",
+            request_context,
+            exc,
+        )
 
 
 def _is_complete_json_object(text: str) -> bool:
@@ -1171,17 +1194,28 @@ def _stop_hook_request_key(session_key: str) -> str:
     return session_key
 
 
-def _iter_nested_strings(value: Any) -> Iterable[str]:
+def _iter_nested_strings(
+    value: Any,
+    _ancestors: Optional[set[int]] = None,
+    _depth: int = 0,
+) -> Iterable[str]:
     if isinstance(value, str):
         yield value
         return
-    if isinstance(value, dict):
-        for item in value.values():
-            yield from _iter_nested_strings(item)
+    if _depth >= NESTED_REQUEST_SCAN_MAX_DEPTH or not isinstance(value, (dict, list)):
         return
-    if isinstance(value, list):
-        for item in value:
-            yield from _iter_nested_strings(item)
+
+    ancestors = _ancestors if _ancestors is not None else set()
+    object_id = id(value)
+    if object_id in ancestors:
+        return
+    ancestors.add(object_id)
+    try:
+        items = value.values() if isinstance(value, dict) else value
+        for item in items:
+            yield from _iter_nested_strings(item, ancestors, _depth + 1)
+    finally:
+        ancestors.discard(object_id)
 
 
 def _has_stop_hook_marker(value: Any) -> bool:
@@ -1191,17 +1225,40 @@ def _has_stop_hook_marker(value: Any) -> bool:
     return False
 
 
-def _has_stop_hook_json_schema(value: Any) -> bool:
-    if isinstance(value, dict):
-        required = value.get("required")
-        if isinstance(required, list) and {"ok", "reason", "impossible"}.issubset(set(required)):
-            return True
-        for item in value.values():
-            if _has_stop_hook_json_schema(item):
-                return True
-    elif isinstance(value, list):
-        return any(_has_stop_hook_json_schema(item) for item in value)
-    return False
+def _has_stop_hook_json_schema(
+    value: Any,
+    _ancestors: Optional[set[int]] = None,
+    _depth: int = 0,
+) -> bool:
+    if _depth >= NESTED_REQUEST_SCAN_MAX_DEPTH:
+        return False
+
+    ancestors = _ancestors if _ancestors is not None else set()
+    if isinstance(value, (dict, list)):
+        object_id = id(value)
+        if object_id in ancestors:
+            return False
+        ancestors.add(object_id)
+    else:
+        return False
+
+    try:
+        if isinstance(value, dict):
+            required = value.get("required")
+            if isinstance(required, list):
+                required_names = {item for item in required if isinstance(item, str)}
+                if {"ok", "reason", "impossible"}.issubset(required_names):
+                    return True
+            return any(
+                _has_stop_hook_json_schema(item, ancestors, _depth + 1)
+                for item in value.values()
+            )
+        return any(
+            _has_stop_hook_json_schema(item, ancestors, _depth + 1)
+            for item in value
+        )
+    finally:
+        ancestors.discard(object_id)
 
 
 def _has_stop_hook_condition_prompt(value: Any) -> bool:
@@ -1926,13 +1983,16 @@ class OpencodeCompatHandler(CustomLogger):
     ) -> AsyncGenerator[Any, None]:
         request_context = _request_context(request_data)
         if _is_messages_stream(request_data):
-            async for chunk in self._convert_anthropic_messages_stream(
-                response,
-                stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
-                request_context=request_context,
-                request_data=request_data,
-            ):
-                yield chunk
+            try:
+                async for chunk in self._convert_anthropic_messages_stream(
+                    response,
+                    stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
+                    request_context=request_context,
+                    request_data=request_data,
+                ):
+                    yield chunk
+            finally:
+                await _close_async_stream(response, request_context)
             return
 
         if _should_skip_stream_conversion(request_data):
