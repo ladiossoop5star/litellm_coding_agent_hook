@@ -960,38 +960,16 @@ async def _iter_with_keepalive(
 
             original_for_output = chunk
             last_chunk_at = time.time()
-            yield chunk
-            # Do not prefetch while the consumer handles the current chunk. The
-            # messages converter can intentionally stop as soon as a complete
-            # tool call arrives; prefetching here leaves another __anext__ task
-            # consuming the upstream stream after the downstream response ends.
             next_chunk = asyncio.create_task(iterator.__anext__())
+            yield chunk
     finally:
         if not next_chunk.done():
             next_chunk.cancel()
-        try:
-            await next_chunk
-        except BaseException:
-            pass
-
-
-async def _close_async_stream(stream: Any, request_context: str) -> None:
-    close = getattr(stream, "aclose", None)
-    if not callable(close):
-        return
-    try:
-        result = close()
-        if result is not None:
-            await result
-    except BaseException as exc:
-        # Cleanup must never replace the valid tool response already delivered
-        # to the coding agent, but retain a diagnostic if a provider cannot be
-        # closed cleanly.
-        log.warning(
-            "failed to close upstream messages stream context=%s error=%s",
-            request_context,
-            exc,
-        )
+        elif not next_chunk.cancelled():
+            try:
+                next_chunk.exception()
+            except Exception:
+                pass
 
 
 def _is_complete_json_object(text: str) -> bool:
@@ -1983,16 +1961,13 @@ class OpencodeCompatHandler(CustomLogger):
     ) -> AsyncGenerator[Any, None]:
         request_context = _request_context(request_data)
         if _is_messages_stream(request_data):
-            try:
-                async for chunk in self._convert_anthropic_messages_stream(
-                    response,
-                    stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
-                    request_context=request_context,
-                    request_data=request_data,
-                ):
-                    yield chunk
-            finally:
-                await _close_async_stream(response, request_context)
+            async for chunk in self._convert_anthropic_messages_stream(
+                response,
+                stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
+                request_context=request_context,
+                request_data=request_data,
+            ):
+                yield chunk
             return
 
         if _should_skip_stream_conversion(request_data):
