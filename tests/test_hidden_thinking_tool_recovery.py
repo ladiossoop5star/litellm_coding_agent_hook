@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import unittest
@@ -5,10 +6,37 @@ from unittest.mock import patch
 
 from opencode_compat_hook.hook import (
     OpencodeCompatHandler,
+    _iter_with_keepalive,
     _is_stop_hook_json_evaluator,
     _raw_think_state,
     _request_tool_schemas,
 )
+
+
+class CloseableBlockingStream:
+    def __init__(self, first_chunk):
+        self.first_chunk = first_chunk
+        self.reads = 0
+        self.pending_read_started = asyncio.Event()
+        self.pending_read_cancelled = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.reads += 1
+        if self.reads == 1:
+            return self.first_chunk
+        self.pending_read_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.pending_read_cancelled.set()
+            raise
+
+    async def aclose(self):
+        self.closed = True
 
 
 BASH_SCHEMA = {
@@ -205,6 +233,56 @@ def emitted_text(rendered):
 class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.handler = object.__new__(OpencodeCompatHandler)
+
+    async def test_keepalive_closes_only_its_request_stream_on_early_exit(self):
+        cancelled_stream = CloseableBlockingStream(b"first")
+        unaffected_stream = CloseableBlockingStream(b"other")
+        cancelled_generator = _iter_with_keepalive(
+            cancelled_stream,
+            request_context="cancelled-request",
+        )
+        unaffected_generator = _iter_with_keepalive(
+            unaffected_stream,
+            request_context="unaffected-request",
+        )
+
+        self.assertEqual(await cancelled_generator.__anext__(), b"first")
+        self.assertEqual(await unaffected_generator.__anext__(), b"other")
+        cancelled_next = asyncio.create_task(cancelled_generator.__anext__())
+        await asyncio.wait_for(cancelled_stream.pending_read_started.wait(), timeout=1.0)
+
+        cancelled_next.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_next
+
+        self.assertTrue(cancelled_stream.pending_read_cancelled.is_set())
+        self.assertTrue(cancelled_stream.closed)
+        self.assertFalse(unaffected_stream.pending_read_cancelled.is_set())
+        self.assertFalse(unaffected_stream.closed)
+
+        await asyncio.wait_for(unaffected_generator.aclose(), timeout=1.0)
+        self.assertTrue(unaffected_stream.closed)
+
+    async def test_messages_hook_closes_provider_stream_when_client_stops(self):
+        first_event = (
+            'event: message_start\ndata: {"type":"message_start","message":'
+            '{"id":"msg_cancel","type":"message","role":"assistant",'
+            '"model":"test","content":[],"stop_reason":null,'
+            '"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+        ).encode()
+        provider_stream = CloseableBlockingStream(first_event)
+        output_stream = self.handler.async_post_call_streaming_iterator_hook(
+            None,
+            provider_stream,
+            {"call_type": "anthropic_messages", "stream": True},
+        )
+
+        first_output = await asyncio.wait_for(output_stream.__anext__(), timeout=1.0)
+        self.assertIn(b"event: message_start", first_output)
+
+        await asyncio.wait_for(output_stream.aclose(), timeout=1.0)
+
+        self.assertTrue(provider_stream.closed)
 
     async def test_complete_tool_call_implicitly_closes_unclosed_thinking(self):
         output, current = await feed(

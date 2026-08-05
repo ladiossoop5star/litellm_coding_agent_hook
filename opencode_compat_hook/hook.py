@@ -34,6 +34,8 @@ STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
 RAW_THINK_PREVIEW_LIMIT = 200
 MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
 MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
+UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS = 2.0
+UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_KEEPALIVE_SECONDS = 5.0
 STOP_HOOK_JSON_FALLBACK_SECONDS = 25.0
@@ -923,6 +925,109 @@ def _sse_comment(text: str, original: Any) -> Any:
     return _encode_like(": " + text + "\n\n", original)
 
 
+async def _cancel_and_close_stream_iterator(
+    iterator: Any,
+    next_chunk: "asyncio.Task[Any]",
+    request_context: str,
+) -> None:
+    """Stop one request's pending stream read without touching its shared session."""
+    cancellation_requested = not next_chunk.done()
+    if cancellation_requested:
+        next_chunk.cancel()
+
+    try:
+        done, _ = await asyncio.wait(
+            {next_chunk},
+            timeout=UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        # Async-generator finalization itself can be cancelled during event-loop
+        # shutdown. The request-scoped outer hook also closes the response.
+        return
+    except BaseException as exc:
+        log.warning(
+            "failed while waiting for upstream stream cancellation context=%s error=%s",
+            request_context,
+            exc,
+        )
+        return
+
+    if next_chunk not in done:
+        # Calling aclose() while __anext__() is still executing can raise
+        # "asynchronous generator is already running". Do not introduce that
+        # race; retain a diagnostic so provider-specific transport abort can be
+        # added if an iterator ever ignores asyncio cancellation.
+        log.error(
+            "upstream stream ignored cancellation after %.1fs context=%s iterator=%s",
+            UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS,
+            request_context,
+            type(iterator).__name__,
+        )
+        return
+
+    try:
+        next_chunk.result()
+    except BaseException:
+        pass
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        try:
+            close_result = close()
+            if close_result is not None:
+                await asyncio.wait_for(
+                    close_result,
+                    timeout=UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS,
+                )
+        except BaseException as exc:
+            log.warning(
+                "failed to close request-scoped upstream stream context=%s "
+                "iterator=%s error=%s",
+                request_context,
+                type(iterator).__name__,
+                exc,
+            )
+            return
+
+    if cancellation_requested:
+        log.info(
+            "cancelled and closed request-scoped upstream stream context=%s iterator=%s",
+            request_context,
+            type(iterator).__name__,
+        )
+
+
+async def _close_request_stream(stream: Any, request_context: str) -> None:
+    """Close one LiteLLM request stream, never the shared HTTP client session."""
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        log.warning(
+            "request-scoped upstream stream has no aclose context=%s stream=%s",
+            request_context,
+            type(stream).__name__,
+        )
+        return
+    try:
+        close_result = close()
+        if close_result is not None:
+            await asyncio.wait_for(
+                close_result,
+                timeout=UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS,
+            )
+    except asyncio.CancelledError:
+        # Do not let cancellation of one cleanup step prevent the outer hook
+        # from attempting to close the provider response as well.
+        return
+    except BaseException as exc:
+        log.warning(
+            "failed to close request-scoped upstream response context=%s "
+            "stream=%s error=%s",
+            request_context,
+            type(stream).__name__,
+            exc,
+        )
+
+
 async def _iter_with_keepalive(
     response: Any,
     request_context: str = "unknown-request",
@@ -962,16 +1067,17 @@ async def _iter_with_keepalive(
 
             original_for_output = chunk
             last_chunk_at = time.time()
-            next_chunk = asyncio.create_task(iterator.__anext__())
             yield chunk
+            # Start the next provider read only when the consumer asks for the
+            # next output chunk. If the converter returns after a complete tool
+            # call, there is no detached prefetch task left reading upstream.
+            next_chunk = asyncio.create_task(iterator.__anext__())
     finally:
-        if not next_chunk.done():
-            next_chunk.cancel()
-        elif not next_chunk.cancelled():
-            try:
-                next_chunk.exception()
-            except Exception:
-                pass
+        await _cancel_and_close_stream_iterator(
+            iterator,
+            next_chunk,
+            request_context,
+        )
 
 
 def _is_complete_json_object(text: str) -> bool:
@@ -2041,13 +2147,21 @@ class OpencodeCompatHandler(CustomLogger):
     ) -> AsyncGenerator[Any, None]:
         request_context = _request_context(request_data)
         if _is_messages_stream(request_data):
-            async for chunk in self._convert_anthropic_messages_stream(
+            converted_stream = self._convert_anthropic_messages_stream(
                 response,
                 stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
                 request_context=request_context,
                 request_data=request_data,
-            ):
-                yield chunk
+            )
+            try:
+                async for chunk in converted_stream:
+                    yield chunk
+            finally:
+                # Closing both levels is deliberate: converted_stream owns the
+                # keepalive iterator, while response owns the provider HTTP
+                # request. Neither object is LiteLLM's shared aiohttp session.
+                await _close_request_stream(converted_stream, request_context)
+                await _close_request_stream(response, request_context)
             return
 
         if _should_skip_stream_conversion(request_data):
