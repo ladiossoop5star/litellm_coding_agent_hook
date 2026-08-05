@@ -1318,6 +1318,26 @@ def _extract_valid_stop_hook_json_text(text: str) -> Optional[str]:
         canonical = _canonical_stop_hook_json(candidate)
         if canonical is not None:
             return canonical
+
+    # When merge_reasoning_content_in_choices joins the last reasoning token
+    # and first visible token from one provider delta, LiteLLM can drop the
+    # first visible fragment (observed as the leading {" before ok). Repair
+    # only the post-thinking suffix and still require a fully typed object.
+    if "</think>" in text:
+        visible_tail = text.rsplit("</think>", 1)[1].strip()
+        repaired_candidates: List[str] = []
+        if re.match(r'^ok"\s*:', visible_tail):
+            repaired_candidates.append('{"' + visible_tail)
+        if re.match(r'^"ok"\s*:', visible_tail):
+            repaired_candidates.append("{" + visible_tail)
+        for repaired in repaired_candidates:
+            try:
+                candidate = json.loads(repaired)
+            except Exception:
+                continue
+            canonical = _canonical_stop_hook_json(candidate)
+            if canonical is not None:
+                return canonical
     return None
 
 
@@ -2881,9 +2901,15 @@ class OpencodeCompatHandler(CustomLogger):
                 "stream-end",
             )
             log.warning(
-                "synthesized Stop hook JSON fallback at stream end context=%s chars=%s",
+                "synthesized Stop hook JSON fallback at stream end context=%s "
+                "thinking_chars=%s text_chars=%s text_preview=%r "
+                "residual_chars=%s residual_preview=%r",
                 request_context,
                 raw_think.get("suppressed_chars") or 0,
+                len(stop_hook_text_buffer),
+                stop_hook_text_buffer[:1000].replace("\n", "\\n"),
+                len(sse_buffer),
+                sse_buffer[:500].replace("\n", "\\n"),
             )
             return
 

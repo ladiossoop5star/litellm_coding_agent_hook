@@ -451,6 +451,24 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision["reason"], "verified by test")
         self.assertEqual(rendered.count("event: message_stop\n"), 1)
 
+    async def test_stop_hook_repairs_json_prefix_lost_at_reasoning_boundary(self):
+        merged = (
+            "<think>The evidence proves the goal is met.</think>"
+            'ok":true,"reason":"all tests passed","impossible":false}'
+        )
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream([merged[:22], merged[22:]]),
+            request_context="test-lost-prefix-stop-hook",
+            request_data=stop_hook_request(),
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        decision = json.loads(emitted_text("".join(output)))
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["reason"], "all tests passed")
+        self.assertFalse(decision["impossible"])
+
     async def test_stop_hook_replaces_invalid_narrative_before_timeout(self):
         narrative = "The assistant still needs to deploy and test the firmware."
         output = []
