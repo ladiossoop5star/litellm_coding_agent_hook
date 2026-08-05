@@ -482,6 +482,42 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision["reason"], "all tests passed")
         self.assertFalse(decision["impossible"])
 
+    async def test_stop_hook_repairs_ok_key_lost_after_thinking_delta(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_thinking_then_text_stream(
+                ["The evidence is sufficient, so the decision is ok true."],
+                ['true,"reason":"all tests passed","impossible":false}'],
+            ),
+            request_context="test-lost-ok-key-stop-hook",
+            request_data=stop_hook_request(),
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        decision = json.loads(emitted_text(rendered))
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["reason"], "all tests passed")
+        self.assertFalse(decision["impossible"])
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+
+    async def test_stop_hook_does_not_treat_ok_prose_as_completion(self):
+        output = []
+        with patch(
+            "opencode_compat_hook.hook._stop_hook_json_fallback_available",
+            return_value=True,
+        ):
+            async for item in self.handler._convert_anthropic_messages_stream(
+                anthropic_text_stream(["The ok result may be true, but no JSON was returned."]),
+                request_context="test-ok-prose-stop-hook",
+                request_data=stop_hook_request(),
+            ):
+                output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        decision = json.loads(emitted_text("".join(output)))
+        self.assertFalse(decision["ok"])
+        self.assertIn("not proven satisfied", decision["reason"])
+
     async def test_stop_hook_replaces_invalid_narrative_before_timeout(self):
         narrative = "The assistant still needs to deploy and test the firmware."
         output = []

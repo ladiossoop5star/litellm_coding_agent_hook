@@ -1319,25 +1319,31 @@ def _extract_valid_stop_hook_json_text(text: str) -> Optional[str]:
         if canonical is not None:
             return canonical
 
-    # When merge_reasoning_content_in_choices joins the last reasoning token
-    # and first visible token from one provider delta, LiteLLM can drop the
-    # first visible fragment (observed as the leading {" before ok). Repair
-    # only the post-thinking suffix and still require a fully typed object.
-    if "</think>" in text:
-        visible_tail = text.rsplit("</think>", 1)[1].strip()
-        repaired_candidates: List[str] = []
-        if re.match(r'^ok"\s*:', visible_tail):
-            repaired_candidates.append('{"' + visible_tail)
-        if re.match(r'^"ok"\s*:', visible_tail):
-            repaired_candidates.append("{" + visible_tail)
-        for repaired in repaired_candidates:
-            try:
-                candidate = json.loads(repaired)
-            except Exception:
-                continue
-            canonical = _canonical_stop_hook_json(candidate)
-            if canonical is not None:
-                return canonical
+    # When one provider delta contains the final reasoning token and the first
+    # visible token, LiteLLM's Anthropic conversion can discard that visible
+    # prefix. We have observed all of these suffixes:
+    #   ok":true,...}       (lost {\")
+    #   "ok":true,...}     (lost {)
+    #   true,"reason":...} (lost {"ok":)
+    # Repair only an unambiguous object prefix. The result must still parse as
+    # a complete object and pass the typed Stop-hook schema below; merely
+    # mentioning "ok" or "true" in prose is never accepted.
+    visible_tail = text.rsplit("</think>", 1)[-1].strip()
+    repaired_candidates: List[str] = []
+    if re.match(r'^ok"\s*:', visible_tail):
+        repaired_candidates.append('{"' + visible_tail)
+    if re.match(r'^"ok"\s*:', visible_tail):
+        repaired_candidates.append("{" + visible_tail)
+    if re.match(r'^(?:true|false)\s*,\s*"reason"\s*:', visible_tail):
+        repaired_candidates.append('{"ok":' + visible_tail)
+    for repaired in repaired_candidates:
+        try:
+            candidate = json.loads(repaired)
+        except Exception:
+            continue
+        canonical = _canonical_stop_hook_json(candidate)
+        if canonical is not None:
+            return canonical
     return None
 
 
