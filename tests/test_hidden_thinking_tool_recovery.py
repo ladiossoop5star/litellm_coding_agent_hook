@@ -103,6 +103,65 @@ async def anthropic_text_stream(chunks):
     yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
+async def anthropic_thinking_then_text_stream(thinking_chunks, text_chunks):
+    yield (
+        'event: message_start\ndata: {"type":"message_start","message":'
+        '{"id":"msg_test","type":"message","role":"assistant","model":"test",'
+        '"content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    ).encode()
+    yield (
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+        '"content_block":{"type":"thinking","thinking":""}}\n\n'
+    ).encode()
+    for chunk in thinking_chunks:
+        yield (
+            "event: content_block_delta\ndata: "
+            + '{"type":"content_block_delta","index":0,"delta":'
+            + '{"type":"thinking_delta","thinking":'
+            + json.dumps(chunk)
+            + "}}\n\n"
+        ).encode()
+    yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    yield (
+        'event: content_block_start\ndata: {"type":"content_block_start","index":1,'
+        '"content_block":{"type":"text","text":""}}\n\n'
+    ).encode()
+    for chunk in text_chunks:
+        yield (
+            "event: content_block_delta\ndata: "
+            + '{"type":"content_block_delta","index":1,"delta":'
+            + '{"type":"text_delta","text":'
+            + json.dumps(chunk)
+            + "}}\n\n"
+        ).encode()
+    yield (
+        'event: message_delta\ndata: {"type":"message_delta","delta":'
+        '{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
+    ).encode()
+    yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+
+async def anthropic_text_in_content_block_start_stream(text):
+    yield (
+        'event: message_start\ndata: {"type":"message_start","message":'
+        '{"id":"msg_test","type":"message","role":"assistant","model":"test",'
+        '"content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    ).encode()
+    yield (
+        "event: content_block_start\ndata: "
+        + '{"type":"content_block_start","index":0,"content_block":'
+        + '{"type":"text","text":'
+        + json.dumps(text)
+        + "}}\n\n"
+    ).encode()
+    yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    yield (
+        'event: message_delta\ndata: {"type":"message_delta","delta":'
+        '{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
+    ).encode()
+    yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+
 async def anthropic_stream_with_transparent_retry():
     yield (
         'event: message_start\ndata: {"type":"message_start","message":'
@@ -257,6 +316,19 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(_is_stop_hook_json_evaluator(request_data))
 
+    async def test_stop_hook_request_disables_reasoning_content_merge(self):
+        request_data = stop_hook_request()
+        request_data["merge_reasoning_content_in_choices"] = True
+
+        result = await self.handler.async_pre_call_hook(
+            None,
+            None,
+            request_data,
+            "anthropic_messages",
+        )
+
+        self.assertFalse(result["merge_reasoning_content_in_choices"])
+
     async def test_transparent_retry_is_ended_before_duplicate_message_start(self):
         output = []
         async for item in self.handler._convert_anthropic_messages_stream(
@@ -300,6 +372,152 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"stop_reason": "end_turn"', rendered)
         record_valid.assert_called_once()
 
+    async def test_stop_hook_allows_active_reasoning_to_finish_valid_json(self):
+        valid_json = '{"ok":true,"reason":"all checks passed","impossible":false}'
+        output = []
+        with (
+            patch(
+                "opencode_compat_hook.hook.STOP_HOOK_JSON_FALLBACK_SECONDS",
+                0.0,
+            ),
+            patch(
+                "opencode_compat_hook.hook.STOP_HOOK_JSON_ACTIVE_MAX_SECONDS",
+                60.0,
+            ),
+            patch(
+                "opencode_compat_hook.hook._record_stop_hook_valid_json"
+            ) as record_valid,
+        ):
+            async for item in self.handler._convert_anthropic_messages_stream(
+                anthropic_thinking_then_text_stream(
+                    ["Evaluate the evidence first. ", "The condition is satisfied."],
+                    [valid_json[:10], valid_json[10:]],
+                ),
+                request_context="test-reasoning-stop-hook",
+                request_data=stop_hook_request(),
+            ):
+                output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(emitted_text(rendered), valid_json)
+        self.assertNotIn("Evaluate the evidence", rendered)
+        self.assertIn('"stop_reason": "end_turn"', rendered)
+        record_valid.assert_called_once()
+
+    async def test_stop_hook_extracts_typed_json_from_goal_complete_wrapper(self):
+        wrapped = (
+            "The work is complete.\n<goal-complete>\n"
+            '{"ok":true,"reason":"verified","impossible":false}'
+            "\n</goal-complete>"
+        )
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream([wrapped]),
+            request_context="test-wrapped-stop-hook",
+            request_data=stop_hook_request(),
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        decision = json.loads(emitted_text("".join(output)))
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["reason"], "verified")
+        self.assertFalse(decision["impossible"])
+
+    async def test_stop_hook_reasoning_only_emits_one_terminal_sequence(self):
+        output = []
+        with patch(
+            "opencode_compat_hook.hook._stop_hook_json_fallback_available",
+            return_value=True,
+        ):
+            async for item in self.handler._convert_anthropic_messages_stream(
+                anthropic_thinking_then_text_stream(
+                    ["The model considered the evidence but omitted its JSON."],
+                    [],
+                ),
+                request_context="test-reasoning-only-stop-hook",
+                request_data=stop_hook_request(),
+            ):
+                output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        decision = json.loads(emitted_text(rendered))
+        self.assertFalse(decision["ok"])
+        self.assertEqual(rendered.count("event: message_start\n"), 1)
+        self.assertEqual(rendered.count("event: content_block_start\n"), 1)
+        self.assertEqual(rendered.count("event: content_block_stop\n"), 1)
+        self.assertEqual(rendered.count("event: message_delta\n"), 1)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+
+    async def test_stop_hook_accepts_json_in_content_block_start(self):
+        valid_json = '{"ok":true,"reason":"verified by test","impossible":false}'
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_in_content_block_start_stream(valid_json),
+            request_context="test-start-text-stop-hook",
+            request_data=stop_hook_request(),
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        decision = json.loads(emitted_text(rendered))
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["reason"], "verified by test")
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+
+    async def test_stop_hook_repairs_json_prefix_lost_at_reasoning_boundary(self):
+        merged = (
+            "<think>The evidence proves the goal is met.</think>"
+            'ok":true,"reason":"all tests passed","impossible":false}'
+        )
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream([merged[:22], merged[22:]]),
+            request_context="test-lost-prefix-stop-hook",
+            request_data=stop_hook_request(),
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        decision = json.loads(emitted_text("".join(output)))
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["reason"], "all tests passed")
+        self.assertFalse(decision["impossible"])
+
+    async def test_stop_hook_repairs_ok_key_lost_after_thinking_delta(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_thinking_then_text_stream(
+                ["The evidence is sufficient, so the decision is ok true."],
+                ['true,"reason":"all tests passed","impossible":false}'],
+            ),
+            request_context="test-lost-ok-key-stop-hook",
+            request_data=stop_hook_request(),
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        decision = json.loads(emitted_text(rendered))
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["reason"], "all tests passed")
+        self.assertFalse(decision["impossible"])
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+
+    async def test_stop_hook_does_not_treat_ok_prose_as_completion(self):
+        output = []
+        with patch(
+            "opencode_compat_hook.hook._stop_hook_json_fallback_available",
+            return_value=True,
+        ):
+            async for item in self.handler._convert_anthropic_messages_stream(
+                anthropic_text_stream(["The ok result may be true, but no JSON was returned."]),
+                request_context="test-ok-prose-stop-hook",
+                request_data=stop_hook_request(),
+            ):
+                output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        decision = json.loads(emitted_text("".join(output)))
+        self.assertFalse(decision["ok"])
+        self.assertIn("not proven satisfied", decision["reason"])
+
     async def test_stop_hook_replaces_invalid_narrative_before_timeout(self):
         narrative = "The assistant still needs to deploy and test the firmware."
         output = []
@@ -311,10 +529,7 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "opencode_compat_hook.hook._record_stop_hook_json_fallback"
             ) as record_fallback,
-            patch(
-                "opencode_compat_hook.hook.STOP_HOOK_JSON_FALLBACK_SECONDS",
-                0.0,
-            ),
+            patch("opencode_compat_hook.hook._stop_hook_json_fallback_due", return_value=True),
         ):
             async for item in self.handler._convert_anthropic_messages_stream(
                 anthropic_text_stream([narrative]),

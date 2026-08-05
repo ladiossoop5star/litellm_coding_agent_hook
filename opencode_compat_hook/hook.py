@@ -37,6 +37,8 @@ MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_KEEPALIVE_SECONDS = 5.0
 STOP_HOOK_JSON_FALLBACK_SECONDS = 25.0
+STOP_HOOK_JSON_PROGRESS_GRACE_SECONDS = 15.0
+STOP_HOOK_JSON_ACTIVE_MAX_SECONDS = 120.0
 NESTED_REQUEST_SCAN_MAX_DEPTH = 64
 STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
 STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
@@ -1276,22 +1278,91 @@ def _stop_hook_json_fallback_text() -> str:
     )
 
 
-def _is_valid_stop_hook_json_text(text: str) -> bool:
+def _canonical_stop_hook_json(value: Any) -> Optional[str]:
+    parsed = value
+    if not isinstance(parsed, dict):
+        return None
+    if not isinstance(parsed.get("ok"), bool):
+        return None
+    if not isinstance(parsed.get("reason"), str):
+        return None
+    impossible = parsed.get("impossible")
+    if impossible is not None and not isinstance(impossible, bool):
+        return None
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+
+def _extract_valid_stop_hook_json_text(text: str) -> Optional[str]:
     stripped = text.strip()
     if not stripped:
-        return False
+        return None
     try:
         parsed = json.loads(stripped)
     except Exception:
+        parsed = None
+    canonical = _canonical_stop_hook_json(parsed)
+    if canonical is not None:
+        return canonical
+
+    # Local models sometimes wrap a schema-compliant object in prose, a JSON
+    # fence, or <goal-complete>. Accept only a complete parsed object with the
+    # exact typed decision fields; a bare mention of "ok" is never sufficient.
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text[index:])
+        except Exception:
+            continue
+        canonical = _canonical_stop_hook_json(candidate)
+        if canonical is not None:
+            return canonical
+
+    # When one provider delta contains the final reasoning token and the first
+    # visible token, LiteLLM's Anthropic conversion can discard that visible
+    # prefix. We have observed all of these suffixes:
+    #   ok":true,...}       (lost {\")
+    #   "ok":true,...}     (lost {)
+    #   true,"reason":...} (lost {"ok":)
+    # Repair only an unambiguous object prefix. The result must still parse as
+    # a complete object and pass the typed Stop-hook schema below; merely
+    # mentioning "ok" or "true" in prose is never accepted.
+    visible_tail = text.rsplit("</think>", 1)[-1].strip()
+    repaired_candidates: List[str] = []
+    if re.match(r'^ok"\s*:', visible_tail):
+        repaired_candidates.append('{"' + visible_tail)
+    if re.match(r'^"ok"\s*:', visible_tail):
+        repaired_candidates.append("{" + visible_tail)
+    if re.match(r'^(?:true|false)\s*,\s*"reason"\s*:', visible_tail):
+        repaired_candidates.append('{"ok":' + visible_tail)
+    for repaired in repaired_candidates:
+        try:
+            candidate = json.loads(repaired)
+        except Exception:
+            continue
+        canonical = _canonical_stop_hook_json(candidate)
+        if canonical is not None:
+            return canonical
+    return None
+
+
+def _is_valid_stop_hook_json_text(text: str) -> bool:
+    return _extract_valid_stop_hook_json_text(text) is not None
+
+
+def _stop_hook_json_fallback_due(
+    started_at: float,
+    last_progress_at: float,
+    now: Optional[float] = None,
+) -> bool:
+    current = time.time() if now is None else now
+    elapsed = current - started_at
+    if elapsed < STOP_HOOK_JSON_FALLBACK_SECONDS:
         return False
-    if not isinstance(parsed, dict):
-        return False
-    if not isinstance(parsed.get("ok"), bool):
-        return False
-    if not isinstance(parsed.get("reason"), str):
-        return False
-    impossible = parsed.get("impossible")
-    return impossible is None or isinstance(impossible, bool)
+    if elapsed >= STOP_HOOK_JSON_ACTIVE_MAX_SECONDS:
+        return True
+    return current - last_progress_at >= STOP_HOOK_JSON_PROGRESS_GRACE_SECONDS
 
 
 def _mutate_stop_hook_fallback_counts(mutator: Any) -> Any:
@@ -1940,6 +2011,15 @@ class OpencodeCompatHandler(CustomLogger):
             request_context = _request_context(request_probe)
             session_key = _stop_hook_session_key(request_probe, request_context)
             _STOP_HOOK_REQUEST_STARTED_AT[_stop_hook_request_key(session_key)] = time.time()
+            # Merging provider reasoning into visible content can drop the
+            # first JSON fragment when one upstream delta contains both the
+            # final reasoning token and the first content token. Keep the two
+            # channels separate for typed Stop decisions only.
+            data["merge_reasoning_content_in_choices"] = False
+            log.info(
+                "disabled reasoning-content merge for Stop hook evaluator context=%s",
+                request_context,
+            )
         return data
 
     async def async_pre_request_hook(self, model: str, messages: List[Any], kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2158,6 +2238,7 @@ class OpencodeCompatHandler(CustomLogger):
         if stop_hook_json_evaluator:
             started_key = _stop_hook_request_key(stop_hook_session_key)
             stop_hook_started_at = _STOP_HOOK_REQUEST_STARTED_AT.pop(started_key, stop_hook_started_at)
+        stop_hook_last_progress_at = stop_hook_started_at
         openai_sse_mode = False
 
         keepalive_seconds = STOP_HOOK_KEEPALIVE_SECONDS if stop_hook_json_evaluator else MESSAGES_STREAM_KEEPALIVE_SECONDS
@@ -2216,7 +2297,10 @@ class OpencodeCompatHandler(CustomLogger):
                     if (
                         stop_hook_json_evaluator
                         and not stop_hook_visible_text
-                        and time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                        and _stop_hook_json_fallback_due(
+                            stop_hook_started_at,
+                            stop_hook_last_progress_at,
+                        )
                         and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
                     ):
                         for event in _messages_text_end_turn_events(
@@ -2283,14 +2367,47 @@ class OpencodeCompatHandler(CustomLogger):
                         log.info("synthesized messages native tool stop from OpenAI SSE context=%s", request_context)
                         return
 
-                    chunk_text = _content_from_delta(delta) or _reasoning_from_delta(delta)
+                    content_text = _content_from_delta(delta)
+                    reasoning_text = _reasoning_from_delta(delta)
+                    chunk_text = content_text or reasoning_text
                     if chunk_text:
                         if stop_hook_json_evaluator:
-                            stop_hook_text_buffer += chunk_text
-                            if _is_valid_stop_hook_json_text(stop_hook_text_buffer):
+                            stop_hook_last_progress_at = time.time()
+                            # The Stop evaluator's response schema applies to visible
+                            # content only. Never prepend provider reasoning to the JSON
+                            # buffer; doing so makes a correct final object unparsable.
+                            if not content_text:
+                                if (
+                                    _stop_hook_json_fallback_due(
+                                        stop_hook_started_at,
+                                        stop_hook_last_progress_at,
+                                    )
+                                    and _stop_hook_json_fallback_available(
+                                        stop_hook_session_key, request_context
+                                    )
+                                ):
+                                    for event in _messages_text_end_turn_events(
+                                        _stop_hook_json_fallback_text(),
+                                        text_block_index,
+                                        chunk,
+                                        start_block=not saw_content_block,
+                                    ):
+                                        yield event
+                                    _record_stop_hook_json_fallback(
+                                        stop_hook_session_key,
+                                        request_context,
+                                        "reasoning-only-openai",
+                                    )
+                                    return
+                                continue
+                            stop_hook_text_buffer += content_text
+                            valid_stop_hook_json = _extract_valid_stop_hook_json_text(
+                                stop_hook_text_buffer
+                            )
+                            if valid_stop_hook_json is not None:
                                 stop_hook_visible_text = True
                                 for event in _messages_text_end_turn_events(
-                                    stop_hook_text_buffer,
+                                    valid_stop_hook_json,
                                     text_block_index,
                                     chunk,
                                     start_block=not saw_content_block,
@@ -2303,7 +2420,10 @@ class OpencodeCompatHandler(CustomLogger):
                                 )
                                 return
                             if (
-                                time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                                _stop_hook_json_fallback_due(
+                                    stop_hook_started_at,
+                                    stop_hook_last_progress_at,
+                                )
                                 and _stop_hook_json_fallback_available(
                                     stop_hook_session_key, request_context
                                 )
@@ -2414,12 +2534,16 @@ class OpencodeCompatHandler(CustomLogger):
                         text_block_index = _event_index(payload, text_block_index)
                         text_delta_type = delta_type
                         if stop_hook_json_evaluator and delta_type == "thinking_delta":
+                            stop_hook_last_progress_at = time.time()
                             if raw_think.get("started_at") is None:
                                 raw_think["started_at"] = time.time()
                             _record_raw_think_suppressed(delta[delta_field], raw_think)
                             if (
                                 not stop_hook_visible_text
-                                and time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                                and _stop_hook_json_fallback_due(
+                                    stop_hook_started_at,
+                                    stop_hook_last_progress_at,
+                                )
                                 and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
                             ):
                                 for event in _messages_text_end_turn_events(
@@ -2446,11 +2570,15 @@ class OpencodeCompatHandler(CustomLogger):
                             and delta_type == "text_delta"
                             and delta[delta_field]
                         ):
+                            stop_hook_last_progress_at = time.time()
                             stop_hook_text_buffer += delta[delta_field]
-                            if _is_valid_stop_hook_json_text(stop_hook_text_buffer):
+                            valid_stop_hook_json = _extract_valid_stop_hook_json_text(
+                                stop_hook_text_buffer
+                            )
+                            if valid_stop_hook_json is not None:
                                 stop_hook_visible_text = True
                                 for event in _messages_text_end_turn_events(
-                                    stop_hook_text_buffer,
+                                    valid_stop_hook_json,
                                     text_block_index,
                                     chunk,
                                     start_block=not saw_content_block,
@@ -2463,7 +2591,10 @@ class OpencodeCompatHandler(CustomLogger):
                                 )
                                 return
                             if (
-                                time.time() - stop_hook_started_at >= STOP_HOOK_JSON_FALLBACK_SECONDS
+                                _stop_hook_json_fallback_due(
+                                    stop_hook_started_at,
+                                    stop_hook_last_progress_at,
+                                )
                                 and _stop_hook_json_fallback_available(
                                     stop_hook_session_key, request_context
                                 )
@@ -2522,6 +2653,46 @@ class OpencodeCompatHandler(CustomLogger):
                         native_tool_json += delta["partial_json"]
 
                 if dsml_mode or passthrough_blocked:
+                    continue
+
+                if stop_hook_json_evaluator and event_name == "content_block_start":
+                    content_block = payload.get("content_block") or {}
+                    start_text = content_block.get("text")
+                    if isinstance(start_text, str) and start_text:
+                        stop_hook_last_progress_at = time.time()
+                        stop_hook_text_buffer += start_text
+                        valid_stop_hook_json = _extract_valid_stop_hook_json_text(
+                            stop_hook_text_buffer
+                        )
+                        if valid_stop_hook_json is not None:
+                            stop_hook_visible_text = True
+                            for event in _messages_text_end_turn_events(
+                                valid_stop_hook_json,
+                                _event_index(payload, text_block_index),
+                                chunk,
+                                start_block=True,
+                            ):
+                                yield event
+                            _record_stop_hook_valid_json(
+                                stop_hook_session_key, request_context
+                            )
+                            log.info(
+                                "emitted content-block-start Stop hook JSON context=%s",
+                                request_context,
+                            )
+                            return
+
+                # The evaluator response is buffered until one complete typed
+                # decision is available. Forward message_start for protocol
+                # framing, but suppress upstream content/terminal frames so a
+                # reasoning-only or malformed answer cannot close the client
+                # stream before the canonical decision (or fallback) is sent.
+                if stop_hook_json_evaluator and event_name in {
+                    "content_block_start",
+                    "content_block_stop",
+                    "message_delta",
+                    "message_stop",
+                }:
                     continue
 
                 if event_name == "content_block_start":
@@ -2745,9 +2916,15 @@ class OpencodeCompatHandler(CustomLogger):
                 "stream-end",
             )
             log.warning(
-                "synthesized Stop hook JSON fallback at stream end context=%s chars=%s",
+                "synthesized Stop hook JSON fallback at stream end context=%s "
+                "thinking_chars=%s text_chars=%s text_preview=%r "
+                "residual_chars=%s residual_preview=%r",
                 request_context,
                 raw_think.get("suppressed_chars") or 0,
+                len(stop_hook_text_buffer),
+                stop_hook_text_buffer[:1000].replace("\n", "\\n"),
+                len(sse_buffer),
+                sse_buffer[:500].replace("\n", "\\n"),
             )
             return
 
