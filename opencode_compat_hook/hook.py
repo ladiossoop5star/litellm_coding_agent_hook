@@ -2005,6 +2005,15 @@ class OpencodeCompatHandler(CustomLogger):
             request_context = _request_context(request_probe)
             session_key = _stop_hook_session_key(request_probe, request_context)
             _STOP_HOOK_REQUEST_STARTED_AT[_stop_hook_request_key(session_key)] = time.time()
+            # Merging provider reasoning into visible content can drop the
+            # first JSON fragment when one upstream delta contains both the
+            # final reasoning token and the first content token. Keep the two
+            # channels separate for typed Stop decisions only.
+            data["merge_reasoning_content_in_choices"] = False
+            log.info(
+                "disabled reasoning-content merge for Stop hook evaluator context=%s",
+                request_context,
+            )
         return data
 
     async def async_pre_request_hook(self, model: str, messages: List[Any], kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:

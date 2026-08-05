@@ -316,6 +316,19 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(_is_stop_hook_json_evaluator(request_data))
 
+    async def test_stop_hook_request_disables_reasoning_content_merge(self):
+        request_data = stop_hook_request()
+        request_data["merge_reasoning_content_in_choices"] = True
+
+        result = await self.handler.async_pre_call_hook(
+            None,
+            None,
+            request_data,
+            "anthropic_messages",
+        )
+
+        self.assertFalse(result["merge_reasoning_content_in_choices"])
+
     async def test_transparent_retry_is_ended_before_duplicate_message_start(self):
         output = []
         async for item in self.handler._convert_anthropic_messages_stream(
