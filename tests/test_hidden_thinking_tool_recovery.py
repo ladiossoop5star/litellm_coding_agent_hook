@@ -141,6 +141,27 @@ async def anthropic_thinking_then_text_stream(thinking_chunks, text_chunks):
     yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
+async def anthropic_text_in_content_block_start_stream(text):
+    yield (
+        'event: message_start\ndata: {"type":"message_start","message":'
+        '{"id":"msg_test","type":"message","role":"assistant","model":"test",'
+        '"content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    ).encode()
+    yield (
+        "event: content_block_start\ndata: "
+        + '{"type":"content_block_start","index":0,"content_block":'
+        + '{"type":"text","text":'
+        + json.dumps(text)
+        + "}}\n\n"
+    ).encode()
+    yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    yield (
+        'event: message_delta\ndata: {"type":"message_delta","delta":'
+        '{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
+    ).encode()
+    yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+
 async def anthropic_stream_with_transparent_retry():
     yield (
         'event: message_start\ndata: {"type":"message_start","message":'
@@ -412,6 +433,22 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rendered.count("event: content_block_start\n"), 1)
         self.assertEqual(rendered.count("event: content_block_stop\n"), 1)
         self.assertEqual(rendered.count("event: message_delta\n"), 1)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+
+    async def test_stop_hook_accepts_json_in_content_block_start(self):
+        valid_json = '{"ok":true,"reason":"verified by test","impossible":false}'
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_in_content_block_start_stream(valid_json),
+            request_context="test-start-text-stop-hook",
+            request_data=stop_hook_request(),
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        decision = json.loads(emitted_text(rendered))
+        self.assertTrue(decision["ok"])
+        self.assertEqual(decision["reason"], "verified by test")
         self.assertEqual(rendered.count("event: message_stop\n"), 1)
 
     async def test_stop_hook_replaces_invalid_narrative_before_timeout(self):

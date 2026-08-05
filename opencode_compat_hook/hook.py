@@ -2620,6 +2620,33 @@ class OpencodeCompatHandler(CustomLogger):
                 if dsml_mode or passthrough_blocked:
                     continue
 
+                if stop_hook_json_evaluator and event_name == "content_block_start":
+                    content_block = payload.get("content_block") or {}
+                    start_text = content_block.get("text")
+                    if isinstance(start_text, str) and start_text:
+                        stop_hook_last_progress_at = time.time()
+                        stop_hook_text_buffer += start_text
+                        valid_stop_hook_json = _extract_valid_stop_hook_json_text(
+                            stop_hook_text_buffer
+                        )
+                        if valid_stop_hook_json is not None:
+                            stop_hook_visible_text = True
+                            for event in _messages_text_end_turn_events(
+                                valid_stop_hook_json,
+                                _event_index(payload, text_block_index),
+                                chunk,
+                                start_block=True,
+                            ):
+                                yield event
+                            _record_stop_hook_valid_json(
+                                stop_hook_session_key, request_context
+                            )
+                            log.info(
+                                "emitted content-block-start Stop hook JSON context=%s",
+                                request_context,
+                            )
+                            return
+
                 # The evaluator response is buffered until one complete typed
                 # decision is available. Forward message_start for protocol
                 # framing, but suppress upstream content/terminal frames so a
