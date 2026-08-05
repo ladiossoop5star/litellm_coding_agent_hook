@@ -389,6 +389,31 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision["reason"], "verified")
         self.assertFalse(decision["impossible"])
 
+    async def test_stop_hook_reasoning_only_emits_one_terminal_sequence(self):
+        output = []
+        with patch(
+            "opencode_compat_hook.hook._stop_hook_json_fallback_available",
+            return_value=True,
+        ):
+            async for item in self.handler._convert_anthropic_messages_stream(
+                anthropic_thinking_then_text_stream(
+                    ["The model considered the evidence but omitted its JSON."],
+                    [],
+                ),
+                request_context="test-reasoning-only-stop-hook",
+                request_data=stop_hook_request(),
+            ):
+                output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        decision = json.loads(emitted_text(rendered))
+        self.assertFalse(decision["ok"])
+        self.assertEqual(rendered.count("event: message_start\n"), 1)
+        self.assertEqual(rendered.count("event: content_block_start\n"), 1)
+        self.assertEqual(rendered.count("event: content_block_stop\n"), 1)
+        self.assertEqual(rendered.count("event: message_delta\n"), 1)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+
     async def test_stop_hook_replaces_invalid_narrative_before_timeout(self):
         narrative = "The assistant still needs to deploy and test the firmware."
         output = []

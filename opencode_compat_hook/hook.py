@@ -2199,7 +2199,6 @@ class OpencodeCompatHandler(CustomLogger):
         stop_hook_session_key = _stop_hook_session_key(request_data, request_context)
         stop_hook_visible_text = False
         stop_hook_text_buffer = ""
-        stop_hook_thinking_indexes: set[int] = set()
         stop_hook_started_at = time.time()
         if stop_hook_json_evaluator:
             started_key = _stop_hook_request_key(stop_hook_session_key)
@@ -2621,22 +2620,17 @@ class OpencodeCompatHandler(CustomLogger):
                 if dsml_mode or passthrough_blocked:
                     continue
 
-                if stop_hook_json_evaluator and event_name == "content_block_start":
-                    content_block = payload.get("content_block") or {}
-                    if content_block.get("type") == "thinking":
-                        stop_hook_thinking_indexes.add(
-                            _event_index(payload, text_block_index)
-                        )
-                        continue
-                if (
-                    stop_hook_json_evaluator
-                    and event_name == "content_block_stop"
-                    and _event_index(payload, text_block_index)
-                    in stop_hook_thinking_indexes
-                ):
-                    stop_hook_thinking_indexes.discard(
-                        _event_index(payload, text_block_index)
-                    )
+                # The evaluator response is buffered until one complete typed
+                # decision is available. Forward message_start for protocol
+                # framing, but suppress upstream content/terminal frames so a
+                # reasoning-only or malformed answer cannot close the client
+                # stream before the canonical decision (or fallback) is sent.
+                if stop_hook_json_evaluator and event_name in {
+                    "content_block_start",
+                    "content_block_stop",
+                    "message_delta",
+                    "message_stop",
+                }:
                     continue
 
                 if event_name == "content_block_start":
