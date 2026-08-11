@@ -8,6 +8,8 @@ from opencode_compat_hook.hook import (
     OpencodeCompatHandler,
     _coerce_value_for_schema,
     _deployment_api_base,
+    _hoist_system_chat_messages,
+    _hoist_system_responses_input,
     _iter_with_keepalive,
     _is_stop_hook_json_evaluator,
     _raw_think_state,
@@ -449,6 +451,78 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
             _coerce_value_for_schema("120", {"anyOf": [{"type": "integer"}, {"type": "string"}]}),
             120,
         )
+
+    def test_hoist_system_chat_messages_merges_into_leading_system(self):
+        messages = [
+            {"role": "system", "content": "base"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "extra"},
+            {"role": "developer", "content": [{"type": "text", "text": "dev note"}]},
+            {"role": "user", "content": "go"},
+        ]
+
+        folded = _hoist_system_chat_messages(messages)
+
+        self.assertEqual(folded, 3)
+        self.assertEqual(
+            messages,
+            [
+                {"role": "system", "content": "base\n\nextra\n\ndev note"},
+                {"role": "user", "content": "hi"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+
+    def test_hoist_system_chat_messages_noop_when_well_formed(self):
+        messages = [
+            {"role": "system", "content": "base"},
+            {"role": "user", "content": "hi"},
+        ]
+
+        self.assertEqual(_hoist_system_chat_messages(messages), 0)
+        self.assertEqual(messages[0]["content"], "base")
+
+    def test_hoist_system_responses_input_merges_instructions(self):
+        data = {
+            "instructions": "base instructions",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "mid system"}],
+                },
+                {"type": "function_call", "name": "f", "call_id": "c1", "arguments": "{}"},
+            ],
+        }
+
+        folded = _hoist_system_responses_input(data)
+
+        self.assertEqual(folded, 1)
+        self.assertEqual(data["instructions"], "base instructions\n\nmid system")
+        self.assertEqual(len(data["input"]), 2)
+        self.assertEqual(data["input"][0]["role"], "user")
+        self.assertEqual(data["input"][1]["type"], "function_call")
+
+    def test_hoist_system_responses_input_noop_without_instruction_items(self):
+        data = {
+            "instructions": "base instructions",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                }
+            ],
+        }
+
+        self.assertEqual(_hoist_system_responses_input(data), 0)
+        self.assertEqual(data["instructions"], "base instructions")
+        self.assertEqual(len(data["input"]), 1)
 
     async def test_explicitly_closed_thinking_keeps_normal_tool_conversion(self):
         output, _ = await feed(

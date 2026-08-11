@@ -862,6 +862,99 @@ def _is_codex_compaction_request(payload: Any) -> bool:
     return any(marker in text for text in _iter_response_input_text(payload.get("input")))
 
 
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: List[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text") or part.get("input_text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n\n".join(parts)
+
+
+def _hoist_system_chat_messages(messages: Any) -> int:
+    """Fold system/developer messages into a single leading system message.
+
+    The Qwen3.6 chat template raises 'System message must be at the beginning.'
+    for any system message not at index 0, and 'Unexpected message role.' for
+    developer messages. Returns the number of messages folded.
+    """
+    if not isinstance(messages, list) or not messages:
+        return 0
+    needs_fix = any(
+        isinstance(msg, dict)
+        and (msg.get("role") == "developer" or (msg.get("role") == "system" and index > 0))
+        for index, msg in enumerate(messages)
+    )
+    if not needs_fix:
+        return 0
+
+    texts: List[str] = []
+    rest: List[Any] = []
+    folded = 0
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") in ("system", "developer"):
+            folded += 1
+            text = _message_content_text(msg.get("content"))
+            if text:
+                texts.append(text)
+            continue
+        rest.append(msg)
+
+    if not texts:
+        if not rest:
+            return 0
+        messages[:] = rest
+        return folded
+    messages[:] = [{"role": "system", "content": "\n\n".join(texts)}] + rest
+    return folded
+
+
+def _hoist_system_responses_input(data: dict) -> int:
+    """Move system/developer input items into the instructions string.
+
+    LiteLLM's Responses->chat bridge turns `instructions` into the leading
+    system message and preserves item roles, so any system/developer item in
+    `input` lands mid-list and trips the Qwen3.6 chat template. Returns the
+    number of items folded.
+    """
+    input_value = data.get("input")
+    if not isinstance(input_value, list):
+        return 0
+
+    def is_instruction_item(item: Any) -> bool:
+        return (
+            isinstance(item, dict)
+            and item.get("role") in ("system", "developer")
+            and item.get("type") in (None, "message")
+        )
+
+    if not any(is_instruction_item(item) for item in input_value):
+        return 0
+
+    texts: List[str] = []
+    rest: List[Any] = []
+    for item in input_value:
+        if is_instruction_item(item):
+            text = _message_content_text(item.get("content"))
+            if text:
+                texts.append(text)
+        else:
+            rest.append(item)
+
+    instructions = data.get("instructions")
+    head = instructions.strip() if isinstance(instructions, str) else ""
+    merged = "\n\n".join(([head] if head else []) + texts)
+    data["instructions"] = merged
+    data["input"] = rest
+    return len(input_value) - len(rest)
+
+
 def _patch_litellm_responses_empty_tools_bridge() -> None:
     global _RESPONSES_EMPTY_TOOLS_PATCHED
 
@@ -2354,12 +2447,26 @@ class OpencodeCompatHandler(CustomLogger):
                 data["stream"] = True
         if call_type in ("responses", "aresponses"):
             _disable_responses_reasoning_merge(data)
+            hoisted = _hoist_system_responses_input(data)
+            if hoisted:
+                log.warning(
+                    "hoisted %d system/developer input items into instructions context=%s",
+                    hoisted,
+                    _request_context(data),
+                )
             _sanitize_response_input_history(data)
             _sanitize_malformed_function_call_history(data)
 
         if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
             return data
 
+        hoisted = _hoist_system_chat_messages(data.get("messages"))
+        if hoisted:
+            log.warning(
+                "hoisted %d system/developer messages into leading system message context=%s",
+                hoisted,
+                _request_context(data),
+            )
         _sanitize_chat_internal_artifact_history(data)
         _normalize_assistant_messages(data.get("messages"))
         request_probe = dict(data)
