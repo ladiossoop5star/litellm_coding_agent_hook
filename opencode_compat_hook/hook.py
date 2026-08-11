@@ -315,9 +315,9 @@ def _stop_after_first_native_tool(request_data: Optional[dict]) -> bool:
     return any(STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER in name.lower() for name in _request_model_names(request_data))
 
 
-def convert_non_streaming_response(response: Any) -> Any:
+def convert_non_streaming_response(response: Any, tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None) -> Any:
     if isinstance(response, dict) and isinstance(response.get("content"), list):
-        return _convert_anthropic_message_response(response)
+        return _convert_anthropic_message_response(response, tool_schemas)
 
     choice = _choice(response)
     if choice is None:
@@ -337,6 +337,7 @@ def convert_non_streaming_response(response: Any) -> Any:
         log.warning("raw tool block detected but parse returned empty: %s", raw_text[:600])
         return response
 
+    _coerce_tool_arguments_for_schemas(parsed, tool_schemas or {})
     _set(msg, "tool_calls", parsed)
     _set(msg, "content", None)
     if reasoning:
@@ -354,7 +355,9 @@ def _tool_input(arguments: str) -> Dict[str, Any]:
         return {}
 
 
-def _convert_anthropic_message_response(response: Dict[str, Any]) -> Dict[str, Any]:
+def _convert_anthropic_message_response(
+    response: Dict[str, Any], tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None
+) -> Dict[str, Any]:
     content = response.get("content") or []
     if not isinstance(content, list):
         return response
@@ -371,6 +374,7 @@ def _convert_anthropic_message_response(response: Dict[str, Any]) -> Dict[str, A
             log.warning("anthropic raw tool block detected but parse returned empty: %s", text[:600])
             return response
 
+        _coerce_tool_arguments_for_schemas(parsed, tool_schemas or {})
         raw_start = find_raw_tool_start(text)
         prefix = text[:raw_start].rstrip()
         new_content: List[Dict[str, Any]] = []
@@ -1894,6 +1898,117 @@ def _request_tool_schemas(request_data: Optional[dict]) -> Dict[str, Dict[str, A
     return schemas
 
 
+_INTEGER_STRING_PATTERN = re.compile(r"^[+-]?\d+$")
+_NUMBER_STRING_PATTERN = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _coerce_string_for_schema_type(value: str, schema_type: str) -> Any:
+    """Best-effort coercion of a string argument to the declared scalar type."""
+    text = value.strip()
+    if schema_type == "integer":
+        if _INTEGER_STRING_PATTERN.match(text):
+            try:
+                return int(text)
+            except ValueError:
+                return value
+        return value
+    if schema_type == "number":
+        if _NUMBER_STRING_PATTERN.match(text):
+            try:
+                number = float(text)
+            except ValueError:
+                return value
+            return int(text) if _INTEGER_STRING_PATTERN.match(text) else number
+        return value
+    if schema_type == "boolean":
+        lowered = text.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        return value
+    return value
+
+
+def _coerce_value_for_schema(value: Any, schema: Any) -> Any:
+    """Coerce raw tool argument values to the types declared by the tool schema.
+
+    Local models frequently emit every raw (DSML/Qwen XML) parameter as a
+    string, so an integer-typed parameter arrives as "120" and is then
+    rejected by schema validation. Only strings are coerced, and only when
+    they unambiguously match the declared scalar type.
+    """
+    if not isinstance(schema, dict):
+        return value
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        for option in schema_type:
+            coerced = _coerce_value_for_schema(value, {**schema, "type": option})
+            if coerced != value or type(coerced) is not type(value):
+                return coerced
+        return value
+
+    if isinstance(value, str) and isinstance(schema_type, str):
+        coerced = _coerce_string_for_schema_type(value, schema_type)
+        if coerced != value or type(coerced) is not type(value):
+            return coerced
+        return value
+
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return {
+                key: _coerce_value_for_schema(item, properties.get(key))
+                for key, item in value.items()
+            }
+        return value
+
+    if isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            return [_coerce_value_for_schema(item, items) for item in value]
+        return value
+
+    for combiner in ("anyOf", "oneOf"):
+        branches = schema.get(combiner)
+        if isinstance(branches, list):
+            for branch in branches:
+                coerced = _coerce_value_for_schema(value, branch)
+                if coerced != value or type(coerced) is not type(value):
+                    return coerced
+    return value
+
+
+def _coerce_tool_arguments_for_schemas(
+    tool_calls: Iterable[Dict[str, Any]], tool_schemas: Dict[str, Dict[str, Any]]
+) -> None:
+    """Rewrite parsed raw tool call arguments in place to match declared types."""
+    if not tool_schemas:
+        return
+    for tool_call in tool_calls:
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        schema = tool_schemas.get(name) if isinstance(name, str) else None
+        if not isinstance(schema, dict):
+            continue
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            continue
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        coerced = _coerce_value_for_schema(parsed, schema)
+        if coerced != parsed:
+            log.info("coerced tool %r argument types to match request schema", name)
+            function["arguments"] = json.dumps(coerced, ensure_ascii=False)
+
+
 def _validate_implicit_tool_calls(
     tool_calls: Iterable[Dict[str, Any]], tool_schemas: Dict[str, Dict[str, Any]]
 ) -> Tuple[bool, str]:
@@ -2276,7 +2391,7 @@ class OpencodeCompatHandler(CustomLogger):
         return None
 
     async def async_post_call_success_hook(self, data: dict, user_api_key_dict: Any, response: Any) -> Any:
-        return convert_non_streaming_response(response)
+        return convert_non_streaming_response(response, _request_tool_schemas(data))
 
     async def async_post_call_streaming_iterator_hook(
         self, user_api_key_dict: Any, response: Any, request_data: dict
@@ -2313,6 +2428,7 @@ class OpencodeCompatHandler(CustomLogger):
         raw_stream_passthrough = False
         thinking_state = 0
         raw_think = _raw_think_state()
+        tool_schemas = _request_tool_schemas(request_data)
         last_id = "chatcmpl-opencode-compat"
         last_model = request_data.get("model", "unknown") if request_data else "unknown"
         last_created = int(time.time())
@@ -2392,6 +2508,7 @@ class OpencodeCompatHandler(CustomLogger):
 
                 parsed = parse_raw_tool_calls(normalize_raw_tool_calls(buffer))
                 if parsed:
+                    _coerce_tool_arguments_for_schemas(parsed, tool_schemas)
                     log.info("converted %d streaming tool_calls", len(parsed))
                     for out_chunk in build_stream_tool_call_chunks(parsed, last_id, last_model, last_created):
                         yield out_chunk
@@ -3253,6 +3370,8 @@ class OpencodeCompatHandler(CustomLogger):
                 yield _messages_text_delta(text_buffer[:idx], text_block_index, original, delta_type)
 
             parsed = parse_raw_tool_calls(normalize_raw_tool_calls(text_buffer))
+            if parsed:
+                _coerce_tool_arguments_for_schemas(parsed, raw_think.get("tool_schemas") or {})
             implicit_tool_boundary = bool(raw_think.pop("implicit_tool_boundary", False))
             validation_error = ""
             if parsed and implicit_tool_boundary:
