@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import unittest
@@ -5,10 +6,41 @@ from unittest.mock import patch
 
 from opencode_compat_hook.hook import (
     OpencodeCompatHandler,
+    _deployment_api_base,
+    _iter_with_keepalive,
     _is_stop_hook_json_evaluator,
     _raw_think_state,
+    _remove_stop_hook_structured_output,
     _request_tool_schemas,
+    _server_info_lacks_grammar,
+    _server_info_url,
 )
+
+
+class CloseableBlockingStream:
+    def __init__(self, first_chunk):
+        self.first_chunk = first_chunk
+        self.reads = 0
+        self.pending_read_started = asyncio.Event()
+        self.pending_read_cancelled = asyncio.Event()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.reads += 1
+        if self.reads == 1:
+            return self.first_chunk
+        self.pending_read_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.pending_read_cancelled.set()
+            raise
+
+    async def aclose(self):
+        self.closed = True
 
 
 BASH_SCHEMA = {
@@ -206,6 +238,56 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.handler = object.__new__(OpencodeCompatHandler)
 
+    async def test_keepalive_closes_only_its_request_stream_on_early_exit(self):
+        cancelled_stream = CloseableBlockingStream(b"first")
+        unaffected_stream = CloseableBlockingStream(b"other")
+        cancelled_generator = _iter_with_keepalive(
+            cancelled_stream,
+            request_context="cancelled-request",
+        )
+        unaffected_generator = _iter_with_keepalive(
+            unaffected_stream,
+            request_context="unaffected-request",
+        )
+
+        self.assertEqual(await cancelled_generator.__anext__(), b"first")
+        self.assertEqual(await unaffected_generator.__anext__(), b"other")
+        cancelled_next = asyncio.create_task(cancelled_generator.__anext__())
+        await asyncio.wait_for(cancelled_stream.pending_read_started.wait(), timeout=1.0)
+
+        cancelled_next.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_next
+
+        self.assertTrue(cancelled_stream.pending_read_cancelled.is_set())
+        self.assertTrue(cancelled_stream.closed)
+        self.assertFalse(unaffected_stream.pending_read_cancelled.is_set())
+        self.assertFalse(unaffected_stream.closed)
+
+        await asyncio.wait_for(unaffected_generator.aclose(), timeout=1.0)
+        self.assertTrue(unaffected_stream.closed)
+
+    async def test_messages_hook_closes_provider_stream_when_client_stops(self):
+        first_event = (
+            'event: message_start\ndata: {"type":"message_start","message":'
+            '{"id":"msg_cancel","type":"message","role":"assistant",'
+            '"model":"test","content":[],"stop_reason":null,'
+            '"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+        ).encode()
+        provider_stream = CloseableBlockingStream(first_event)
+        output_stream = self.handler.async_post_call_streaming_iterator_hook(
+            None,
+            provider_stream,
+            {"call_type": "anthropic_messages", "stream": True},
+        )
+
+        first_output = await asyncio.wait_for(output_stream.__anext__(), timeout=1.0)
+        self.assertIn(b"event: message_start", first_output)
+
+        await asyncio.wait_for(output_stream.aclose(), timeout=1.0)
+
+        self.assertTrue(provider_stream.closed)
+
     async def test_complete_tool_call_implicitly_closes_unclosed_thinking(self):
         output, current = await feed(
             self.handler,
@@ -328,6 +410,79 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(result["merge_reasoning_content_in_choices"])
+
+    def test_stop_hook_deployment_capability_helpers(self):
+        self.assertEqual(
+            _deployment_api_base({"litellm_params": {"api_base": "http://pgc2:9527/v1/"}}),
+            "http://pgc2:9527/v1",
+        )
+        self.assertEqual(
+            _server_info_url("http://pgc2:9527/v1"),
+            "http://pgc2:9527/get_server_info",
+        )
+        self.assertTrue(_server_info_lacks_grammar({"speculative_algorithm": "DFLASH"}))
+        self.assertFalse(_server_info_lacks_grammar({"speculative_algorithm": "EAGLE"}))
+        self.assertFalse(_server_info_lacks_grammar({"served_model_name": "qwen"}))
+
+    def test_remove_stop_hook_structured_output_preserves_other_output_options(self):
+        request_data = stop_hook_request()
+        request_data["output_config"] = {
+            "verbosity": "low",
+            "format": request_data["response_format"],
+        }
+
+        self.assertTrue(_remove_stop_hook_structured_output(request_data))
+        self.assertNotIn("response_format", request_data)
+        self.assertEqual(request_data["output_config"], {"verbosity": "low"})
+
+    async def test_deployment_hook_only_downgrades_incompatible_stop_evaluator(self):
+        stop_request = stop_hook_request()
+        stop_request["api_base"] = "http://pgc2:9527/v1"
+        with patch.object(
+            self.handler,
+            "_deployment_lacks_stop_hook_grammar",
+            return_value=True,
+        ):
+            result = await self.handler.async_pre_call_deployment_hook(
+                stop_request,
+                "anthropic_messages",
+            )
+        self.assertIs(result, stop_request)
+        self.assertNotIn("response_format", stop_request)
+
+        ordinary_request = {
+            "api_base": "http://pgc2:9527/v1",
+            "call_type": "anthropic_messages",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "json_schema"},
+        }
+        with patch.object(
+            self.handler,
+            "_deployment_lacks_stop_hook_grammar",
+            side_effect=AssertionError("ordinary requests must not probe capabilities"),
+        ):
+            result = await self.handler.async_pre_call_deployment_hook(
+                ordinary_request,
+                "anthropic_messages",
+            )
+        self.assertIsNone(result)
+        self.assertIn("response_format", ordinary_request)
+
+    async def test_deployment_hook_keeps_schema_for_supported_deployment(self):
+        request_data = stop_hook_request()
+        request_data["api_base"] = "http://other:9527/v1"
+        with patch.object(
+            self.handler,
+            "_deployment_lacks_stop_hook_grammar",
+            return_value=False,
+        ):
+            result = await self.handler.async_pre_call_deployment_hook(
+                request_data,
+                "anthropic_messages",
+            )
+        self.assertIsNone(result)
+        self.assertIn("response_format", request_data)
 
     async def test_transparent_retry_is_ended_before_duplicate_message_start(self):
         output = []

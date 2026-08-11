@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.types.utils import ModelResponseStream
@@ -34,11 +35,16 @@ STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
 RAW_THINK_PREVIEW_LIMIT = 200
 MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
 MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
+UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS = 2.0
+UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
 REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
 STOP_HOOK_KEEPALIVE_SECONDS = 5.0
 STOP_HOOK_JSON_FALLBACK_SECONDS = 25.0
 STOP_HOOK_JSON_PROGRESS_GRACE_SECONDS = 15.0
 STOP_HOOK_JSON_ACTIVE_MAX_SECONDS = 120.0
+STOP_HOOK_CAPABILITY_CACHE_SECONDS = 30.0
+STOP_HOOK_CAPABILITY_ERROR_CACHE_SECONDS = 5.0
+STOP_HOOK_CAPABILITY_TIMEOUT_SECONDS = 0.5
 NESTED_REQUEST_SCAN_MAX_DEPTH = 64
 STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
 STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
@@ -48,6 +54,72 @@ _RESPONSES_REASONING_TEXT_PATCHED = False
 _STOP_HOOK_JSON_FALLBACK_COUNTS_PATH = "/tmp/opencode_compat_stop_hook_fallback_counts.json"
 _STOP_HOOK_JSON_FALLBACK_COUNTS: Dict[str, int] = {}
 _STOP_HOOK_REQUEST_STARTED_AT: Dict[str, float] = {}
+
+
+def _deployment_api_base(request_data: Optional[dict]) -> str:
+    if not isinstance(request_data, dict):
+        return ""
+    candidates = [request_data.get("api_base")]
+    for key in ("litellm_params", "metadata", "litellm_metadata"):
+        nested = request_data.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested.get("api_base"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+            return candidate.rstrip("/")
+    return ""
+
+
+def _server_info_url(api_base: str) -> str:
+    try:
+        parsed = urlsplit(api_base)
+    except Exception:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    return urlunsplit((parsed.scheme, parsed.netloc, path + "/get_server_info", "", ""))
+
+
+def _server_info_fingerprint(server_info: dict) -> Tuple[str, ...]:
+    return tuple(
+        str(server_info.get(key) or "")
+        for key in (
+            "model_path",
+            "served_model_name",
+            "weight_version",
+            "speculative_algorithm",
+            "version",
+        )
+    )
+
+
+def _server_info_lacks_grammar(server_info: Any) -> bool:
+    if not isinstance(server_info, dict):
+        return False
+    # Current SGLang DFLASH rejects every grammar-constrained request. This is
+    # deployment capability detection, not a model-name allow/deny list.
+    algorithm = str(server_info.get("speculative_algorithm") or "").upper()
+    return algorithm == "DFLASH"
+
+
+def _remove_stop_hook_structured_output(request_data: dict) -> bool:
+    changed = request_data.pop("response_format", None) is not None
+    output_config = request_data.get("output_config")
+    if isinstance(output_config, dict):
+        cleaned = dict(output_config)
+        for key in ("format", "response_format"):
+            value = cleaned.get(key)
+            if value is not None and _has_stop_hook_json_schema(value):
+                cleaned.pop(key, None)
+                changed = True
+        if cleaned:
+            request_data["output_config"] = cleaned
+        elif changed:
+            request_data.pop("output_config", None)
+    return changed
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -923,6 +995,109 @@ def _sse_comment(text: str, original: Any) -> Any:
     return _encode_like(": " + text + "\n\n", original)
 
 
+async def _cancel_and_close_stream_iterator(
+    iterator: Any,
+    next_chunk: "asyncio.Task[Any]",
+    request_context: str,
+) -> None:
+    """Stop one request's pending stream read without touching its shared session."""
+    cancellation_requested = not next_chunk.done()
+    if cancellation_requested:
+        next_chunk.cancel()
+
+    try:
+        done, _ = await asyncio.wait(
+            {next_chunk},
+            timeout=UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        # Async-generator finalization itself can be cancelled during event-loop
+        # shutdown. The request-scoped outer hook also closes the response.
+        return
+    except BaseException as exc:
+        log.warning(
+            "failed while waiting for upstream stream cancellation context=%s error=%s",
+            request_context,
+            exc,
+        )
+        return
+
+    if next_chunk not in done:
+        # Calling aclose() while __anext__() is still executing can raise
+        # "asynchronous generator is already running". Do not introduce that
+        # race; retain a diagnostic so provider-specific transport abort can be
+        # added if an iterator ever ignores asyncio cancellation.
+        log.error(
+            "upstream stream ignored cancellation after %.1fs context=%s iterator=%s",
+            UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS,
+            request_context,
+            type(iterator).__name__,
+        )
+        return
+
+    try:
+        next_chunk.result()
+    except BaseException:
+        pass
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        try:
+            close_result = close()
+            if close_result is not None:
+                await asyncio.wait_for(
+                    close_result,
+                    timeout=UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS,
+                )
+        except BaseException as exc:
+            log.warning(
+                "failed to close request-scoped upstream stream context=%s "
+                "iterator=%s error=%s",
+                request_context,
+                type(iterator).__name__,
+                exc,
+            )
+            return
+
+    if cancellation_requested:
+        log.info(
+            "cancelled and closed request-scoped upstream stream context=%s iterator=%s",
+            request_context,
+            type(iterator).__name__,
+        )
+
+
+async def _close_request_stream(stream: Any, request_context: str) -> None:
+    """Close one LiteLLM request stream, never the shared HTTP client session."""
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        log.warning(
+            "request-scoped upstream stream has no aclose context=%s stream=%s",
+            request_context,
+            type(stream).__name__,
+        )
+        return
+    try:
+        close_result = close()
+        if close_result is not None:
+            await asyncio.wait_for(
+                close_result,
+                timeout=UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS,
+            )
+    except asyncio.CancelledError:
+        # Do not let cancellation of one cleanup step prevent the outer hook
+        # from attempting to close the provider response as well.
+        return
+    except BaseException as exc:
+        log.warning(
+            "failed to close request-scoped upstream response context=%s "
+            "stream=%s error=%s",
+            request_context,
+            type(stream).__name__,
+            exc,
+        )
+
+
 async def _iter_with_keepalive(
     response: Any,
     request_context: str = "unknown-request",
@@ -962,16 +1137,17 @@ async def _iter_with_keepalive(
 
             original_for_output = chunk
             last_chunk_at = time.time()
-            next_chunk = asyncio.create_task(iterator.__anext__())
             yield chunk
+            # Start the next provider read only when the consumer asks for the
+            # next output chunk. If the converter returns after a complete tool
+            # call, there is no detached prefetch task left reading upstream.
+            next_chunk = asyncio.create_task(iterator.__anext__())
     finally:
-        if not next_chunk.done():
-            next_chunk.cancel()
-        elif not next_chunk.cancelled():
-            try:
-                next_chunk.exception()
-            except Exception:
-                pass
+        await _cancel_and_close_stream_iterator(
+            iterator,
+            next_chunk,
+            request_context,
+        )
 
 
 def _is_complete_json_object(text: str) -> bool:
@@ -1869,6 +2045,7 @@ class OpencodeCompatHandler(CustomLogger):
     """Compatibility layer for opencode raw DSML/Qwen tool-call output."""
 
     def __init__(self) -> None:
+        self._stop_hook_capability_cache: Dict[str, Tuple[float, bool, Tuple[str, ...]]] = {}
         _patch_litellm_responses_empty_tools_bridge()
         _patch_litellm_responses_reasoning_text_bridge()
         _patch_litellm_client_disconnect_metadata()
@@ -1980,6 +2157,71 @@ class OpencodeCompatHandler(CustomLogger):
         except Exception as exc:
             log.warning("failed to register messages count_tokens compatibility route: %s", exc)
 
+    async def _deployment_lacks_stop_hook_grammar(self, api_base: str) -> bool:
+        capability_cache = getattr(self, "_stop_hook_capability_cache", None)
+        if capability_cache is None:
+            capability_cache = {}
+            self._stop_hook_capability_cache = capability_cache
+        now = time.monotonic()
+        cached = capability_cache.get(api_base)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+
+        info_url = _server_info_url(api_base)
+        if not info_url:
+            return False
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(
+                timeout=STOP_HOOK_CAPABILITY_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(info_url)
+                response.raise_for_status()
+                server_info = response.json()
+            unsupported = _server_info_lacks_grammar(server_info)
+            fingerprint = _server_info_fingerprint(server_info) if isinstance(server_info, dict) else ()
+            capability_cache[api_base] = (
+                now + STOP_HOOK_CAPABILITY_CACHE_SECONDS,
+                unsupported,
+                fingerprint,
+            )
+            return unsupported
+        except Exception as exc:
+            # Unknown/non-SGLang endpoints preserve their original structured
+            # output request. A short negative cache avoids adding latency to
+            # repeated Stop checks while an endpoint is unavailable.
+            capability_cache[api_base] = (
+                now + STOP_HOOK_CAPABILITY_ERROR_CACHE_SECONDS,
+                False,
+                (),
+            )
+            log.debug("Stop hook capability lookup failed for %s: %s", info_url, exc)
+            return False
+
+    async def async_pre_call_deployment_hook(self, kwargs: Dict[str, Any], call_type: Any) -> Optional[dict]:
+        request_probe = dict(kwargs)
+        if not request_probe.get("call_type"):
+            request_probe["call_type"] = str(getattr(call_type, "value", call_type) or "")
+        if not _is_stop_hook_json_evaluator(request_probe):
+            return None
+
+        api_base = _deployment_api_base(kwargs)
+        if not api_base or not await self._deployment_lacks_stop_hook_grammar(api_base):
+            return None
+        if _remove_stop_hook_structured_output(kwargs):
+            cached = getattr(self, "_stop_hook_capability_cache", {}).get(api_base)
+            fingerprint = cached[2] if cached is not None else ()
+            log.warning(
+                "disabled upstream structured output for Stop hook evaluator "
+                "because deployment lacks grammar support api_base=%s fingerprint=%s",
+                api_base,
+                fingerprint,
+            )
+            return kwargs
+        return None
+
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
         _sanitize_request_tools(data, call_type)
         if call_type == "anthropic_messages":
@@ -2041,13 +2283,21 @@ class OpencodeCompatHandler(CustomLogger):
     ) -> AsyncGenerator[Any, None]:
         request_context = _request_context(request_data)
         if _is_messages_stream(request_data):
-            async for chunk in self._convert_anthropic_messages_stream(
+            converted_stream = self._convert_anthropic_messages_stream(
                 response,
                 stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
                 request_context=request_context,
                 request_data=request_data,
-            ):
-                yield chunk
+            )
+            try:
+                async for chunk in converted_stream:
+                    yield chunk
+            finally:
+                # Closing both levels is deliberate: converted_stream owns the
+                # keepalive iterator, while response owns the provider HTTP
+                # request. Neither object is LiteLLM's shared aiohttp session.
+                await _close_request_stream(converted_stream, request_context)
+                await _close_request_stream(response, request_context)
             return
 
         if _should_skip_stream_conversion(request_data):
