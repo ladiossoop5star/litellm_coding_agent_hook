@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from opencode_compat_hook.hook import (
     OpencodeCompatHandler,
+    _coerce_value_for_schema,
     _deployment_api_base,
     _iter_with_keepalive,
     _is_stop_hook_json_evaluator,
@@ -53,6 +54,26 @@ BASH_SCHEMA = {
     "additionalProperties": False,
 }
 
+READ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "file_path": {"type": "string"},
+        "offset": {"type": "integer"},
+        "limit": {"type": "integer"},
+    },
+    "required": ["file_path"],
+}
+
+GREP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pattern": {"type": "string"},
+        "head_limit": {"type": "number"},
+        "multiline": {"type": "boolean"},
+    },
+    "required": ["pattern"],
+}
+
 
 def state():
     raw_think = _raw_think_state()
@@ -64,6 +85,12 @@ def state():
         "dsml_mode": False,
         "raw_think": raw_think,
     }
+
+
+def state_with_tools(tool_schemas):
+    current = state()
+    current["raw_think"]["tool_schemas"] = tool_schemas
+    return current
 
 
 async def feed(handler, chunks, current_state):
@@ -351,6 +378,77 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn('"type": "tool_use"', output)
         self.assertIn("model output malformed", output)
+
+    async def test_integer_string_hidden_tool_argument_is_coerced_and_executed(self):
+        output, _ = await feed(
+            self.handler,
+            [
+                "<think>read the file\n<tool_call>\n<function=Read>\n"
+                "<parameter=file_path>\n/tmp/a.txt\n</parameter>\n"
+                "<parameter=limit>\n120\n</parameter>\n</function>\n</tool_call>\n"
+            ],
+            state_with_tools({"Read": READ_SCHEMA}),
+        )
+
+        self.assertIn('"type": "tool_use"', output)
+        self.assertIn('"name": "Read"', output)
+        self.assertIn('\\"limit\\": 120', output)
+        self.assertNotIn("model output malformed", output)
+
+    async def test_normal_tool_block_arguments_are_coerced(self):
+        output, _ = await feed(
+            self.handler,
+            [
+                "<think>plan</think>\n<tool_call>\n<function=Grep>\n"
+                "<parameter=pattern>\nfoo\n</parameter>\n"
+                "<parameter=head_limit>\n12.5\n</parameter>\n"
+                "<parameter=multiline>\ntrue\n</parameter>\n"
+                "</function>\n</tool_call>\n"
+            ],
+            state_with_tools({"Grep": GREP_SCHEMA}),
+        )
+
+        self.assertIn('"type": "tool_use"', output)
+        self.assertIn('\\"head_limit\\": 12.5', output)
+        self.assertIn('\\"multiline\\": true', output)
+
+    async def test_non_numeric_string_hidden_tool_argument_is_still_rejected(self):
+        output, _ = await feed(
+            self.handler,
+            [
+                "<think>try this\n<tool_call>\n<function=Read>\n"
+                "<parameter=file_path>\n/tmp/a.txt\n</parameter>\n"
+                "<parameter=limit>\nabc\n</parameter>\n</function>\n</tool_call>\n"
+            ],
+            state_with_tools({"Read": READ_SCHEMA}),
+        )
+
+        self.assertNotIn('"type": "tool_use"', output)
+        self.assertIn("model output malformed", output)
+
+    def test_coerce_value_for_schema_scalars(self):
+        self.assertEqual(_coerce_value_for_schema("120", {"type": "integer"}), 120)
+        self.assertEqual(_coerce_value_for_schema(" -3 ", {"type": "integer"}), -3)
+        self.assertEqual(_coerce_value_for_schema("12.5", {"type": "number"}), 12.5)
+        self.assertEqual(_coerce_value_for_schema("7", {"type": "number"}), 7)
+        self.assertIs(_coerce_value_for_schema("true", {"type": "boolean"}), True)
+        self.assertIs(_coerce_value_for_schema("FALSE", {"type": "boolean"}), False)
+        self.assertEqual(_coerce_value_for_schema("abc", {"type": "integer"}), "abc")
+        self.assertEqual(_coerce_value_for_schema("120", {"type": "string"}), "120")
+        self.assertEqual(_coerce_value_for_schema(120, {"type": "integer"}), 120)
+        self.assertEqual(_coerce_value_for_schema("120", {"type": ["integer", "null"]}), 120)
+        self.assertEqual(
+            _coerce_value_for_schema({"limit": "5"}, {"properties": {"limit": {"type": "integer"}}}),
+            {"limit": 5},
+        )
+        self.assertEqual(
+            _coerce_value_for_schema(["1", "2"], {"type": "array", "items": {"type": "integer"}}),
+            [1, 2],
+        )
+        self.assertEqual(
+            _coerce_value_for_schema("120", {"anyOf": [{"type": "integer"}, {"type": "string"}]}),
+            120,
+        )
 
     async def test_explicitly_closed_thinking_keeps_normal_tool_conversion(self):
         output, _ = await feed(
