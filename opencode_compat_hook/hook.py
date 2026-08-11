@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.types.utils import ModelResponseStream
@@ -41,6 +42,9 @@ STOP_HOOK_KEEPALIVE_SECONDS = 5.0
 STOP_HOOK_JSON_FALLBACK_SECONDS = 25.0
 STOP_HOOK_JSON_PROGRESS_GRACE_SECONDS = 15.0
 STOP_HOOK_JSON_ACTIVE_MAX_SECONDS = 120.0
+STOP_HOOK_CAPABILITY_CACHE_SECONDS = 30.0
+STOP_HOOK_CAPABILITY_ERROR_CACHE_SECONDS = 5.0
+STOP_HOOK_CAPABILITY_TIMEOUT_SECONDS = 0.5
 NESTED_REQUEST_SCAN_MAX_DEPTH = 64
 STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
 STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
@@ -50,6 +54,72 @@ _RESPONSES_REASONING_TEXT_PATCHED = False
 _STOP_HOOK_JSON_FALLBACK_COUNTS_PATH = "/tmp/opencode_compat_stop_hook_fallback_counts.json"
 _STOP_HOOK_JSON_FALLBACK_COUNTS: Dict[str, int] = {}
 _STOP_HOOK_REQUEST_STARTED_AT: Dict[str, float] = {}
+
+
+def _deployment_api_base(request_data: Optional[dict]) -> str:
+    if not isinstance(request_data, dict):
+        return ""
+    candidates = [request_data.get("api_base")]
+    for key in ("litellm_params", "metadata", "litellm_metadata"):
+        nested = request_data.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested.get("api_base"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+            return candidate.rstrip("/")
+    return ""
+
+
+def _server_info_url(api_base: str) -> str:
+    try:
+        parsed = urlsplit(api_base)
+    except Exception:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    return urlunsplit((parsed.scheme, parsed.netloc, path + "/get_server_info", "", ""))
+
+
+def _server_info_fingerprint(server_info: dict) -> Tuple[str, ...]:
+    return tuple(
+        str(server_info.get(key) or "")
+        for key in (
+            "model_path",
+            "served_model_name",
+            "weight_version",
+            "speculative_algorithm",
+            "version",
+        )
+    )
+
+
+def _server_info_lacks_grammar(server_info: Any) -> bool:
+    if not isinstance(server_info, dict):
+        return False
+    # Current SGLang DFLASH rejects every grammar-constrained request. This is
+    # deployment capability detection, not a model-name allow/deny list.
+    algorithm = str(server_info.get("speculative_algorithm") or "").upper()
+    return algorithm == "DFLASH"
+
+
+def _remove_stop_hook_structured_output(request_data: dict) -> bool:
+    changed = request_data.pop("response_format", None) is not None
+    output_config = request_data.get("output_config")
+    if isinstance(output_config, dict):
+        cleaned = dict(output_config)
+        for key in ("format", "response_format"):
+            value = cleaned.get(key)
+            if value is not None and _has_stop_hook_json_schema(value):
+                cleaned.pop(key, None)
+                changed = True
+        if cleaned:
+            request_data["output_config"] = cleaned
+        elif changed:
+            request_data.pop("output_config", None)
+    return changed
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -1975,6 +2045,7 @@ class OpencodeCompatHandler(CustomLogger):
     """Compatibility layer for opencode raw DSML/Qwen tool-call output."""
 
     def __init__(self) -> None:
+        self._stop_hook_capability_cache: Dict[str, Tuple[float, bool, Tuple[str, ...]]] = {}
         _patch_litellm_responses_empty_tools_bridge()
         _patch_litellm_responses_reasoning_text_bridge()
         _patch_litellm_client_disconnect_metadata()
@@ -2085,6 +2156,71 @@ class OpencodeCompatHandler(CustomLogger):
             log.info("registered opencode compatibility routes %s", ", ".join(route_paths))
         except Exception as exc:
             log.warning("failed to register messages count_tokens compatibility route: %s", exc)
+
+    async def _deployment_lacks_stop_hook_grammar(self, api_base: str) -> bool:
+        capability_cache = getattr(self, "_stop_hook_capability_cache", None)
+        if capability_cache is None:
+            capability_cache = {}
+            self._stop_hook_capability_cache = capability_cache
+        now = time.monotonic()
+        cached = capability_cache.get(api_base)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+
+        info_url = _server_info_url(api_base)
+        if not info_url:
+            return False
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(
+                timeout=STOP_HOOK_CAPABILITY_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(info_url)
+                response.raise_for_status()
+                server_info = response.json()
+            unsupported = _server_info_lacks_grammar(server_info)
+            fingerprint = _server_info_fingerprint(server_info) if isinstance(server_info, dict) else ()
+            capability_cache[api_base] = (
+                now + STOP_HOOK_CAPABILITY_CACHE_SECONDS,
+                unsupported,
+                fingerprint,
+            )
+            return unsupported
+        except Exception as exc:
+            # Unknown/non-SGLang endpoints preserve their original structured
+            # output request. A short negative cache avoids adding latency to
+            # repeated Stop checks while an endpoint is unavailable.
+            capability_cache[api_base] = (
+                now + STOP_HOOK_CAPABILITY_ERROR_CACHE_SECONDS,
+                False,
+                (),
+            )
+            log.debug("Stop hook capability lookup failed for %s: %s", info_url, exc)
+            return False
+
+    async def async_pre_call_deployment_hook(self, kwargs: Dict[str, Any], call_type: Any) -> Optional[dict]:
+        request_probe = dict(kwargs)
+        if not request_probe.get("call_type"):
+            request_probe["call_type"] = str(getattr(call_type, "value", call_type) or "")
+        if not _is_stop_hook_json_evaluator(request_probe):
+            return None
+
+        api_base = _deployment_api_base(kwargs)
+        if not api_base or not await self._deployment_lacks_stop_hook_grammar(api_base):
+            return None
+        if _remove_stop_hook_structured_output(kwargs):
+            cached = getattr(self, "_stop_hook_capability_cache", {}).get(api_base)
+            fingerprint = cached[2] if cached is not None else ()
+            log.warning(
+                "disabled upstream structured output for Stop hook evaluator "
+                "because deployment lacks grammar support api_base=%s fingerprint=%s",
+                api_base,
+                fingerprint,
+            )
+            return kwargs
+        return None
 
     async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
         _sanitize_request_tools(data, call_type)

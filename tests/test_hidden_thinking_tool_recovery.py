@@ -6,10 +6,14 @@ from unittest.mock import patch
 
 from opencode_compat_hook.hook import (
     OpencodeCompatHandler,
+    _deployment_api_base,
     _iter_with_keepalive,
     _is_stop_hook_json_evaluator,
     _raw_think_state,
+    _remove_stop_hook_structured_output,
     _request_tool_schemas,
+    _server_info_lacks_grammar,
+    _server_info_url,
 )
 
 
@@ -406,6 +410,79 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(result["merge_reasoning_content_in_choices"])
+
+    def test_stop_hook_deployment_capability_helpers(self):
+        self.assertEqual(
+            _deployment_api_base({"litellm_params": {"api_base": "http://pgc2:9527/v1/"}}),
+            "http://pgc2:9527/v1",
+        )
+        self.assertEqual(
+            _server_info_url("http://pgc2:9527/v1"),
+            "http://pgc2:9527/get_server_info",
+        )
+        self.assertTrue(_server_info_lacks_grammar({"speculative_algorithm": "DFLASH"}))
+        self.assertFalse(_server_info_lacks_grammar({"speculative_algorithm": "EAGLE"}))
+        self.assertFalse(_server_info_lacks_grammar({"served_model_name": "qwen"}))
+
+    def test_remove_stop_hook_structured_output_preserves_other_output_options(self):
+        request_data = stop_hook_request()
+        request_data["output_config"] = {
+            "verbosity": "low",
+            "format": request_data["response_format"],
+        }
+
+        self.assertTrue(_remove_stop_hook_structured_output(request_data))
+        self.assertNotIn("response_format", request_data)
+        self.assertEqual(request_data["output_config"], {"verbosity": "low"})
+
+    async def test_deployment_hook_only_downgrades_incompatible_stop_evaluator(self):
+        stop_request = stop_hook_request()
+        stop_request["api_base"] = "http://pgc2:9527/v1"
+        with patch.object(
+            self.handler,
+            "_deployment_lacks_stop_hook_grammar",
+            return_value=True,
+        ):
+            result = await self.handler.async_pre_call_deployment_hook(
+                stop_request,
+                "anthropic_messages",
+            )
+        self.assertIs(result, stop_request)
+        self.assertNotIn("response_format", stop_request)
+
+        ordinary_request = {
+            "api_base": "http://pgc2:9527/v1",
+            "call_type": "anthropic_messages",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "json_schema"},
+        }
+        with patch.object(
+            self.handler,
+            "_deployment_lacks_stop_hook_grammar",
+            side_effect=AssertionError("ordinary requests must not probe capabilities"),
+        ):
+            result = await self.handler.async_pre_call_deployment_hook(
+                ordinary_request,
+                "anthropic_messages",
+            )
+        self.assertIsNone(result)
+        self.assertIn("response_format", ordinary_request)
+
+    async def test_deployment_hook_keeps_schema_for_supported_deployment(self):
+        request_data = stop_hook_request()
+        request_data["api_base"] = "http://other:9527/v1"
+        with patch.object(
+            self.handler,
+            "_deployment_lacks_stop_hook_grammar",
+            return_value=False,
+        ):
+            result = await self.handler.async_pre_call_deployment_hook(
+                request_data,
+                "anthropic_messages",
+            )
+        self.assertIsNone(result)
+        self.assertIn("response_format", request_data)
 
     async def test_transparent_retry_is_ended_before_duplicate_message_start(self):
         output = []
