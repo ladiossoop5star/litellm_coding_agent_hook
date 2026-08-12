@@ -1999,6 +1999,60 @@ def _flush_raw_think_tail(state: Dict[str, Any]) -> str:
     return "" if state.get("in_think") else tail
 
 
+def _yield_unclosed_think_completion(
+    raw_think: Dict[str, Any],
+    pending: List[str],
+    unflushed_text: str,
+    text_block_index: int,
+    text_delta_type: str,
+    original: Any,
+    request_context: str,
+    has_native_tool: bool,
+    open_content_blocks: Iterable[int],
+) -> Tuple[List[Any], List[str], str]:
+    events: List[Any] = []
+    open_blocks = set(open_content_blocks)
+    tail = _flush_raw_think_tail(raw_think)
+    if tail:
+        unflushed_text += tail
+    fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+    if fallback:
+        events.append(_messages_text_delta(fallback, text_block_index, original, "text_delta"))
+        raw_think["warned_unclosed"] = True
+    placeholder = _empty_unclosed_raw_think_placeholder(
+        raw_think, request_context, pending, unflushed_text, has_native_tool
+    )
+    if placeholder:
+        if text_block_index in open_blocks:
+            events.append(_messages_text_delta(placeholder, text_block_index, original, text_delta_type))
+        else:
+            placeholder_index = text_block_index + 1
+            events.append(
+                _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": placeholder_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                    original,
+                )
+            )
+            events.append(_messages_text_delta(placeholder, placeholder_index, original, "text_delta"))
+            events.append(
+                _sse("content_block_stop", {"type": "content_block_stop", "index": placeholder_index}, original)
+            )
+    for item in pending:
+        events.append(_messages_text_delta(item, text_block_index, original, text_delta_type))
+    pending = []
+    if unflushed_text:
+        events.append(_messages_text_delta(unflushed_text, text_block_index, original, text_delta_type))
+        unflushed_text = ""
+    if raw_think.get("in_think") and not raw_think.get("warned_unclosed"):
+        _warn_unclosed_raw_think(raw_think, request_context)
+    return events, pending, unflushed_text
+
+
 def _messages_tool_use_events(tool_calls: Iterable[Dict[str, Any]], start_index: int, original: Any) -> List[Any]:
     events: List[Any] = []
     index = start_index
@@ -2841,6 +2895,43 @@ class OpencodeCompatHandler(CustomLogger):
                 if payload is None:
                     if openai_sse_mode and "[DONE]" in raw_event:
                         if not saw_message_stop and not synthetic_stop_sent:
+                            if (
+                                stop_hook_json_evaluator
+                                and not stop_hook_visible_text
+                                and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
+                            ):
+                                for event in _messages_text_end_turn_events(
+                                    _stop_hook_json_fallback_text(),
+                                    text_block_index,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_json_fallback(
+                                    stop_hook_session_key,
+                                    request_context,
+                                    "done-without-text",
+                                )
+                                log.warning(
+                                    "synthesized Stop hook JSON fallback after empty [DONE] stream context=%s "
+                                    "thinking_chars=%s",
+                                    request_context,
+                                    raw_think.get("suppressed_chars") or 0,
+                                )
+                                return
+                            events, pending, unflushed_text = _yield_unclosed_think_completion(
+                                raw_think,
+                                pending,
+                                unflushed_text,
+                                text_block_index,
+                                text_delta_type,
+                                chunk,
+                                request_context,
+                                any(bool(entry.get("name")) for entry in openai_tool_state.values()),
+                                open_content_blocks,
+                            )
+                            for event in events:
+                                yield event
                             for index in sorted(open_content_blocks):
                                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
                             if not saw_stop_message_delta:
@@ -3051,27 +3142,19 @@ class OpencodeCompatHandler(CustomLogger):
                     choice = _choice(payload)
                     finish_reason = _get(choice, "finish_reason", None)
                     if finish_reason:
-                        tail = _flush_raw_think_tail(raw_think)
-                        if tail:
-                            unflushed_text += tail
-                        fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
-                        if fallback:
-                            yield _messages_text_delta(fallback, text_block_index, chunk, "text_delta")
-                        placeholder = _empty_unclosed_raw_think_placeholder(
+                        events, pending, unflushed_text = _yield_unclosed_think_completion(
                             raw_think,
-                            request_context,
                             pending,
                             unflushed_text,
+                            text_block_index,
+                            text_delta_type,
+                            chunk,
+                            request_context,
                             any(bool(entry.get("name")) for entry in openai_tool_state.values()),
+                            open_content_blocks,
                         )
-                        if placeholder:
-                            yield _messages_text_delta(placeholder, text_block_index, chunk, text_delta_type)
-                        for item in pending:
-                            yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
-                        pending = []
-                        if unflushed_text:
-                            yield _messages_text_delta(unflushed_text, text_block_index, chunk, text_delta_type)
-                            unflushed_text = ""
+                        for event in events:
+                            yield event
                         for index in sorted(open_content_blocks):
                             yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
                         open_content_blocks.clear()
@@ -3474,15 +3557,30 @@ class OpencodeCompatHandler(CustomLogger):
                     )
                     return
         else:
-            tail = _flush_raw_think_tail(raw_think)
-            if tail:
-                unflushed_text += tail
-            if raw_think.get("in_think"):
-                _warn_unclosed_raw_think(raw_think, request_context)
-            for item in pending:
-                yield _messages_text_delta(item, text_block_index, original_for_output, text_delta_type)
-            if unflushed_text:
-                yield _messages_text_delta(unflushed_text, text_block_index, original_for_output, text_delta_type)
+            if stop_hook_json_evaluator and not stop_hook_visible_text:
+                tail = _flush_raw_think_tail(raw_think)
+                if tail:
+                    unflushed_text += tail
+                if raw_think.get("in_think"):
+                    _warn_unclosed_raw_think(raw_think, request_context)
+                for item in pending:
+                    yield _messages_text_delta(item, text_block_index, original_for_output, text_delta_type)
+                if unflushed_text:
+                    yield _messages_text_delta(unflushed_text, text_block_index, original_for_output, text_delta_type)
+            else:
+                events, pending, unflushed_text = _yield_unclosed_think_completion(
+                    raw_think,
+                    pending,
+                    unflushed_text,
+                    text_block_index,
+                    text_delta_type,
+                    original_for_output,
+                    request_context,
+                    any(bool(entry.get("name")) for entry in openai_tool_state.values()),
+                    open_content_blocks,
+                )
+                for event in events:
+                    yield event
 
         if sse_buffer and not passthrough_blocked:
             yield _encode_like(sse_buffer, original_for_output)

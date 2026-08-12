@@ -278,6 +278,23 @@ async def openai_text_stream(chunks, finish_reason="stop"):
     yield b"data: [DONE]\n\n"
 
 
+async def openai_stream_no_finish_reason(chunks, include_done=True):
+    yield (
+        'data: {"id":"chatcmpl_test","object":"chat.completion.chunk","model":"test",'
+        '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
+        '"finish_reason":null}]}\n\n'
+    ).encode()
+    for chunk in chunks:
+        yield (
+            'data: {"id":"chatcmpl_test","object":"chat.completion.chunk","model":"test",'
+            '"choices":[{"index":0,"delta":{"content":'
+            + json.dumps(chunk)
+            + '},"finish_reason":null}]}\n\n'
+        ).encode()
+    if include_done:
+        yield b"data: [DONE]\n\n"
+
+
 async def anthropic_stream_with_transparent_retry():
     yield (
         'event: message_start\ndata: {"type":"message_start","message":'
@@ -1122,6 +1139,66 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"stop_reason":"end_turn"', rendered)
         text = emitted_text(rendered)
         self.assertIn("long revealed reasoning", text)
+        self.assertNotIn("<think>", rendered)
+
+    async def test_unclosed_think_with_content_ends_well_formed_at_done(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            openai_stream_no_finish_reason(["<think>internal reasoning never closed"]),
+            request_context="test-unclosed-think-done",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertIn('"stop_reason": "end_turn"', rendered)
+        self.assertIn("internal reasoning never closed", emitted_text(rendered))
+        self.assertNotIn("<think>", rendered)
+
+    async def test_empty_unclosed_think_emits_placeholder_at_done(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            openai_stream_no_finish_reason(["<think>"]),
+            request_context="test-empty-unclosed-think-done",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertEqual(emitted_text(rendered), ".")
+        self.assertNotIn("<think>", rendered)
+
+    async def test_unclosed_think_with_content_ends_well_formed_at_eof(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            openai_stream_no_finish_reason(
+                ["<think>internal reasoning never closed"], include_done=False
+            ),
+            request_context="test-unclosed-think-eof",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertIn('"stop_reason": "end_turn"', rendered)
+        self.assertIn("internal reasoning never closed", emitted_text(rendered))
+        self.assertNotIn("<think>", rendered)
+
+    async def test_empty_unclosed_think_emits_placeholder_at_eof(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            openai_stream_no_finish_reason(["<think>"], include_done=False),
+            request_context="test-empty-unclosed-think-eof",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertEqual(emitted_text(rendered), ".")
         self.assertNotIn("<think>", rendered)
 
 
