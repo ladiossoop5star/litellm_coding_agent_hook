@@ -27,14 +27,14 @@ model_list:
     litellm_params:
       model: openai/qwen-3.6-27b
       #model: openai/laguna-s-2.1
-      #model: openai/qwops
+      #model: openai/ling-3
       api_base: http://10.115.140.137:9527/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
       max_tokens: 32768
 
-      merge_reasoning_content_in_choices: true
+      merge_reasoning_content_in_choices: false
     model_info:
       max_tokens: 200000
       max_input_tokens: 167232
