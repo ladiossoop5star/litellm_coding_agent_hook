@@ -356,6 +356,17 @@ def emitted_text(rendered):
     return "".join(text)
 
 
+def content_block_start_indexes(rendered):
+    indexes = []
+    for line in rendered.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = json.loads(line[6:])
+        if payload.get("type") == "content_block_start":
+            indexes.append(payload.get("index"))
+    return indexes
+
+
 class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.handler = object.__new__(OpencodeCompatHandler)
@@ -616,6 +627,42 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_hoist_system_responses_input(data), 0)
         self.assertEqual(data["instructions"], "base instructions")
         self.assertEqual(len(data["input"]), 1)
+
+    async def test_stop_hook_fallback_block_index_rebased_to_zero(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_thinking_then_text_stream(
+                ["checking the situation"],
+                ["I looked at the logs and the answer is prose."],
+            ),
+            request_context="test-fallback-reindex-%s" % time.time(),
+            request_data=stop_hook_request(),
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        indexes = content_block_start_indexes(rendered)
+        self.assertTrue(indexes)
+        self.assertEqual(indexes, [0] * len(indexes))
+        self.assertIn("No usable Stop hook JSON", rendered)
+
+    async def test_stop_hook_valid_json_block_index_rebased_to_zero(self):
+        valid_json = '{"ok":true,"reason":"all done","impossible":false}'
+        output = []
+        with patch("opencode_compat_hook.hook._record_stop_hook_valid_json"):
+            async for item in self.handler._convert_anthropic_messages_stream(
+                anthropic_thinking_then_text_stream(
+                    ["thinking about it"],
+                    [valid_json[:15], valid_json[15:]],
+                ),
+                request_context="test-valid-reindex-%s" % time.time(),
+                request_data=stop_hook_request(),
+            ):
+                output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(content_block_start_indexes(rendered), [0])
+        self.assertEqual(emitted_text(rendered), valid_json)
 
     async def test_explicitly_closed_thinking_keeps_normal_tool_conversion(self):
         output, _ = await feed(
