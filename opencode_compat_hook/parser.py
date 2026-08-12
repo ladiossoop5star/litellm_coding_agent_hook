@@ -50,6 +50,8 @@ RAW_TOOL_FRAGMENT_MARKERS = RAW_TOOL_OPEN_MARKERS + (
     "<dcp-message-id>",
     "</dcp-message-id>",
     "</tool_calls>",
+    "</parameter>",
+    "</invoke>",
     "</tool_call>",
 )
 

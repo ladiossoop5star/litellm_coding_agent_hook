@@ -664,6 +664,38 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content_block_start_indexes(rendered), [0])
         self.assertEqual(emitted_text(rendered), valid_json)
 
+    async def test_orphan_parameter_close_triggers_malformed_fallback(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream(["Let me run the build now. ", "</parameter>"]),
+            request_context="test-orphan-parameter-close",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        visible = emitted_text(rendered)
+        self.assertNotIn("</parameter>", visible)
+        self.assertIn("model output malformed", visible)
+        self.assertIn('"stop_reason": "end_turn"', rendered)
+
+    async def test_prose_with_parameter_opening_tag_passes_through(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream(
+                ["You can set it via ", '<parameter name="threads">', " in the config file."]
+            ),
+            request_context="test-prose-parameter-tag",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        visible = emitted_text("".join(output))
+        self.assertEqual(
+            visible,
+            'You can set it via <parameter name="threads"> in the config file.',
+        )
+
     async def test_explicitly_closed_thinking_keeps_normal_tool_conversion(self):
         output, _ = await feed(
             self.handler,
