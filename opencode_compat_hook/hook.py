@@ -50,6 +50,12 @@ STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
 STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
 STOP_HOOK_HISTORY_HEAD_MAX_TOKENS = 2048
 STOP_HOOK_HISTORY_TAIL_MAX_TOKENS = 4096
+# Stop hook evaluator streams suppress every upstream content frame, so the
+# synthesized decision block is always the first client-visible content block
+# and must use index 0. Reusing the upstream block index (e.g. 2 after two
+# suppressed thinking blocks) leaves gaps that strict clients reject as
+# "empty or malformed response (HTTP 200)".
+STOP_HOOK_CLIENT_BLOCK_INDEX = 0
 COUNT_TOKENS_NATIVE_MAX_ESTIMATE = 8192
 _RESPONSES_EMPTY_TOOLS_PATCHED = False
 _RESPONSES_REASONING_TEXT_PATCHED = False
@@ -2902,7 +2908,7 @@ class OpencodeCompatHandler(CustomLogger):
                             ):
                                 for event in _messages_text_end_turn_events(
                                     _stop_hook_json_fallback_text(),
-                                    text_block_index,
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
                                     chunk,
                                     start_block=not saw_content_block,
                                 ):
@@ -2960,7 +2966,7 @@ class OpencodeCompatHandler(CustomLogger):
                     ):
                         for event in _messages_text_end_turn_events(
                             _stop_hook_json_fallback_text(),
-                            text_block_index,
+                            STOP_HOOK_CLIENT_BLOCK_INDEX,
                             chunk,
                             start_block=not saw_content_block,
                         ):
@@ -3043,7 +3049,7 @@ class OpencodeCompatHandler(CustomLogger):
                                 ):
                                     for event in _messages_text_end_turn_events(
                                         _stop_hook_json_fallback_text(),
-                                        text_block_index,
+                                        STOP_HOOK_CLIENT_BLOCK_INDEX,
                                         chunk,
                                         start_block=not saw_content_block,
                                     ):
@@ -3063,7 +3069,7 @@ class OpencodeCompatHandler(CustomLogger):
                                 stop_hook_visible_text = True
                                 for event in _messages_text_end_turn_events(
                                     valid_stop_hook_json,
-                                    text_block_index,
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
                                     chunk,
                                     start_block=not saw_content_block,
                                 ):
@@ -3197,7 +3203,7 @@ class OpencodeCompatHandler(CustomLogger):
                             ):
                                 for event in _messages_text_end_turn_events(
                                     _stop_hook_json_fallback_text(),
-                                    text_block_index,
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
                                     chunk,
                                     start_block=not saw_content_block,
                                 ):
@@ -3228,7 +3234,7 @@ class OpencodeCompatHandler(CustomLogger):
                                 stop_hook_visible_text = True
                                 for event in _messages_text_end_turn_events(
                                     valid_stop_hook_json,
-                                    text_block_index,
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
                                     chunk,
                                     start_block=not saw_content_block,
                                 ):
@@ -3250,7 +3256,7 @@ class OpencodeCompatHandler(CustomLogger):
                             ):
                                 for event in _messages_text_end_turn_events(
                                     _stop_hook_json_fallback_text(),
-                                    text_block_index,
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
                                     chunk,
                                     start_block=not saw_content_block,
                                 ):
@@ -3317,7 +3323,7 @@ class OpencodeCompatHandler(CustomLogger):
                             stop_hook_visible_text = True
                             for event in _messages_text_end_turn_events(
                                 valid_stop_hook_json,
-                                _event_index(payload, text_block_index),
+                                STOP_HOOK_CLIENT_BLOCK_INDEX,
                                 chunk,
                                 start_block=True,
                             ):
@@ -3577,7 +3583,7 @@ class OpencodeCompatHandler(CustomLogger):
                 ):
                     for event in _messages_text_end_turn_events(
                         _stop_hook_json_fallback_text(),
-                        text_block_index,
+                        STOP_HOOK_CLIENT_BLOCK_INDEX,
                         original_for_output,
                         start_block=not saw_content_block,
                     ):
@@ -3642,7 +3648,7 @@ class OpencodeCompatHandler(CustomLogger):
         ):
             for event in _messages_text_end_turn_events(
                 _stop_hook_json_fallback_text(),
-                text_block_index,
+                STOP_HOOK_CLIENT_BLOCK_INDEX,
                 original_for_output,
                 start_block=not saw_content_block,
             ):
