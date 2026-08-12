@@ -235,6 +235,27 @@ async def anthropic_text_with_block_stop_stream(chunks):
     yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
+async def anthropic_text_stream_stop_only(chunks):
+    yield (
+        'event: message_start\ndata: {"type":"message_start","message":'
+        '{"id":"msg_test","type":"message","role":"assistant","model":"test",'
+        '"content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    ).encode()
+    yield (
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+        '"content_block":{"type":"text","text":""}}\n\n'
+    ).encode()
+    for chunk in chunks:
+        yield (
+            "event: content_block_delta\ndata: "
+            + '{"type":"content_block_delta","index":0,"delta":'
+            + '{"type":"text_delta","text":'
+            + json.dumps(chunk)
+            + "}}\n\n"
+        ).encode()
+    yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+
 async def anthropic_text_in_content_block_start_stream(text):
     yield (
         'event: message_start\ndata: {"type":"message_start","message":'
@@ -1120,6 +1141,46 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         for line in text_delta_lines:
             index = json.loads(line[6:]).get("index")
             self.assertEqual(index, 1)
+
+    async def test_unclosed_think_message_stop_without_delta_ends_well_formed(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream_stop_only(["<think>internal reasoning never closed"]),
+            request_context="test-unclosed-think-stop-only",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertIn("internal reasoning never closed", emitted_text(rendered))
+        self.assertNotIn("<think>", rendered)
+        self.assertEqual(rendered.count("event: content_block_stop\n"), 1)
+        delta_index = rendered.find("event: message_delta\n")
+        stop_index = rendered.find("event: message_stop\n")
+        self.assertNotEqual(delta_index, -1)
+        self.assertLess(delta_index, stop_index)
+        self.assertIn('"stop_reason": "end_turn"', rendered)
+
+    async def test_empty_unclosed_think_message_stop_without_delta_emits_placeholder(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream_stop_only(["<think>"]),
+            request_context="test-empty-unclosed-think-stop-only",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertEqual(emitted_text(rendered), ".")
+        self.assertNotIn("<think>", rendered)
+        self.assertEqual(rendered.count("event: content_block_stop\n"), 1)
+        delta_index = rendered.find("event: message_delta\n")
+        stop_index = rendered.find("event: message_stop\n")
+        self.assertNotEqual(delta_index, -1)
+        self.assertLess(delta_index, stop_index)
+        self.assertIn('"stop_reason": "end_turn"', rendered)
 
     async def test_revealed_thinking_ends_well_formed_without_placeholder(self):
         output = []

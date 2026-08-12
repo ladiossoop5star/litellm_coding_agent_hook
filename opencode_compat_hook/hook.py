@@ -3413,6 +3413,55 @@ class OpencodeCompatHandler(CustomLogger):
                         yield _messages_text_delta(unflushed_text, text_block_index, chunk, text_delta_type)
                         unflushed_text = ""
                     text_buffer = ""
+                    if event_name == "message_stop" and not saw_stop_message_delta:
+                        placeholder = _empty_unclosed_raw_think_placeholder(
+                            raw_think,
+                            request_context,
+                            pending,
+                            unflushed_text,
+                            native_tool_index is not None,
+                        )
+                        if placeholder:
+                            if text_block_index in open_content_blocks:
+                                yield _messages_text_delta(
+                                    placeholder, text_block_index, chunk, text_delta_type
+                                )
+                            else:
+                                placeholder_index = text_block_index + 1
+                                yield _sse(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": placeholder_index,
+                                        "content_block": {"type": "text", "text": ""},
+                                    },
+                                    chunk,
+                                )
+                                yield _messages_text_delta(
+                                    placeholder, placeholder_index, chunk, "text_delta"
+                                )
+                                yield _sse(
+                                    "content_block_stop",
+                                    {"type": "content_block_stop", "index": placeholder_index},
+                                    chunk,
+                                )
+                        for index in sorted(open_content_blocks):
+                            yield _sse(
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": index},
+                                chunk,
+                            )
+                        open_content_blocks.clear()
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                "usage": {"output_tokens": 0},
+                            },
+                            chunk,
+                        )
+                        saw_stop_message_delta = True
 
                 if event_name == "message_start":
                     if saw_message_start:
