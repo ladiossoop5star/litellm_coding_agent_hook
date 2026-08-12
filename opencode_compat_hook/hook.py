@@ -48,6 +48,8 @@ STOP_HOOK_CAPABILITY_TIMEOUT_SECONDS = 0.5
 NESTED_REQUEST_SCAN_MAX_DEPTH = 64
 STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
 STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
+STOP_HOOK_HISTORY_HEAD_MAX_TOKENS = 2048
+STOP_HOOK_HISTORY_TAIL_MAX_TOKENS = 4096
 COUNT_TOKENS_NATIVE_MAX_ESTIMATE = 8192
 _RESPONSES_EMPTY_TOOLS_PATCHED = False
 _RESPONSES_REASONING_TEXT_PATCHED = False
@@ -1536,6 +1538,87 @@ def _is_stop_hook_json_evaluator(request_data: Optional[dict]) -> bool:
     )
 
 
+def _stop_hook_condition_prompt_message_index(messages: Any) -> int:
+    if not isinstance(messages, list):
+        return -1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        text = _message_content_text(message.get("content") or "")
+        if "hook_event_name" in text and "stopping condition" in text and "ARGUMENTS" in text:
+            return index
+    return -1
+
+
+def _truncate_stop_hook_history(data: dict) -> int:
+    """Keep head + tail of the Stop hook evaluator conversation under a token budget.
+
+    The full multi-hundred-K token session history is not needed to decide
+    whether the current turn is terminal; only the injected condition prompt,
+    the system context, and the most recent exchanges matter. Keeping the head
+    preserves the shared prefix for the radix KV cache while trimming the bulk
+    of the middle, so the prefill stays well under Claude Code's 30s Stop hook
+    timeout. Truncation is bounded by an estimated token budget rather than a
+    raw message count, because a handful of tool results can hold tens of
+    thousands of tokens (source dumps, build logs). Returns the number of
+    messages dropped.
+    """
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    if not messages:
+        return 0
+    condition_index = _stop_hook_condition_prompt_message_index(messages)
+
+    def message_tokens(index: int) -> int:
+        return _estimate_count_tokens(messages[index])
+
+    total_tokens = sum(message_tokens(index) for index in range(len(messages)))
+    if total_tokens <= STOP_HOOK_HISTORY_HEAD_MAX_TOKENS + STOP_HOOK_HISTORY_TAIL_MAX_TOKENS:
+        return 0
+
+    # Build the head: system prompt plus as many early messages as fit.
+    head = 1
+    head_tokens = message_tokens(0)
+    while (
+        head < len(messages)
+        and head_tokens + message_tokens(head) <= STOP_HOOK_HISTORY_HEAD_MAX_TOKENS
+    ):
+        head_tokens += message_tokens(head)
+        head += 1
+
+    # Build the tail: recent messages working backwards until the budget fills.
+    tail = 0
+    tail_tokens = 0
+    while tail < len(messages) - head:
+        candidate = len(messages) - 1 - tail
+        if tail_tokens + message_tokens(candidate) > STOP_HOOK_HISTORY_TAIL_MAX_TOKENS:
+            break
+        tail_tokens += message_tokens(candidate)
+        tail += 1
+    if tail == 0:
+        tail = 1
+        tail_tokens = message_tokens(len(messages) - 1)
+
+    tail_start = len(messages) - tail
+    if head > tail_start:
+        return 0
+
+    # The injected condition prompt must survive; it usually lives in the tail,
+    # but when it sits in the dropped middle, pull it into the head.
+    if 0 <= condition_index < tail_start:
+        if condition_index >= head:
+            head = condition_index + 1
+        if head > tail_start:
+            head = tail_start
+
+    dropped = len(messages) - head - tail
+    if dropped <= 0:
+        return 0
+    data["messages"] = messages[:head] + messages[tail_start:]
+    return dropped
+
+
 def _stop_hook_json_fallback_text() -> str:
     return json.dumps(
         {
@@ -1797,24 +1880,20 @@ def _raw_think_has_visible_output(
     )
 
 
-def _raise_empty_unclosed_raw_think(
+def _empty_unclosed_raw_think_placeholder(
     state: Dict[str, Any],
     context: str,
     pending: Iterable[str],
     unflushed_text: str,
     has_native_tool: bool,
-) -> None:
+) -> str:
     if not state.get("in_think") or has_native_tool:
-        return
+        return ""
 
-    _warn_unclosed_raw_think(state, context)
     if _raw_think_has_visible_output(state, pending, unflushed_text):
-        return
+        return ""
 
-    raise RuntimeError(
-        "malformed model output: unclosed raw <think> produced an empty assistant turn "
-        f"({context})"
-    )
+    return _raw_think_placeholder(state, context)
 
 
 def _matching_prefix_suffix(text: str, marker: str) -> str:
@@ -2480,6 +2559,13 @@ class OpencodeCompatHandler(CustomLogger):
             # final reasoning token and the first content token. Keep the two
             # channels separate for typed Stop decisions only.
             data["merge_reasoning_content_in_choices"] = False
+            dropped = _truncate_stop_hook_history(data)
+            if dropped:
+                log.info(
+                    "truncated Stop hook evaluator history by %d messages context=%s",
+                    dropped,
+                    request_context,
+                )
             log.info(
                 "disabled reasoning-content merge for Stop hook evaluator context=%s",
                 request_context,
@@ -2657,7 +2743,11 @@ class OpencodeCompatHandler(CustomLogger):
         fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
         if fallback:
             unflushed_text += fallback
-        _raise_empty_unclosed_raw_think(raw_think, request_context, pending, unflushed_text, False)
+        placeholder = _empty_unclosed_raw_think_placeholder(
+            raw_think, request_context, pending, unflushed_text, False
+        )
+        if placeholder:
+            unflushed_text += placeholder
 
         if dsml_mode:
             if content_collected:
@@ -2967,13 +3057,15 @@ class OpencodeCompatHandler(CustomLogger):
                         fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
                         if fallback:
                             yield _messages_text_delta(fallback, text_block_index, chunk, "text_delta")
-                        _raise_empty_unclosed_raw_think(
+                        placeholder = _empty_unclosed_raw_think_placeholder(
                             raw_think,
                             request_context,
                             pending,
                             unflushed_text,
                             any(bool(entry.get("name")) for entry in openai_tool_state.values()),
                         )
+                        if placeholder:
+                            yield _messages_text_delta(placeholder, text_block_index, chunk, text_delta_type)
                         for item in pending:
                             yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
                         pending = []
@@ -3192,13 +3284,37 @@ class OpencodeCompatHandler(CustomLogger):
                         if stop_reason:
                             saw_stop_message_delta = True
                         if stop_reason == "end_turn":
-                            _raise_empty_unclosed_raw_think(
+                            placeholder = _empty_unclosed_raw_think_placeholder(
                                 raw_think,
                                 request_context,
                                 pending,
                                 unflushed_text,
                                 native_tool_index is not None,
                             )
+                            if placeholder:
+                                if text_block_index in open_content_blocks:
+                                    yield _messages_text_delta(
+                                        placeholder, text_block_index, chunk, text_delta_type
+                                    )
+                                else:
+                                    placeholder_index = text_block_index + 1
+                                    yield _sse(
+                                        "content_block_start",
+                                        {
+                                            "type": "content_block_start",
+                                            "index": placeholder_index,
+                                            "content_block": {"type": "text", "text": ""},
+                                        },
+                                        chunk,
+                                    )
+                                    yield _messages_text_delta(
+                                        placeholder, placeholder_index, chunk, "text_delta"
+                                    )
+                                    yield _sse(
+                                        "content_block_stop",
+                                        {"type": "content_block_stop", "index": placeholder_index},
+                                        chunk,
+                                    )
                         elif raw_think.get("in_think"):
                             _warn_unclosed_raw_think(raw_think, request_context)
                     elif event_name == "message_stop" and raw_think.get("in_think"):

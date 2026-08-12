@@ -8,6 +8,7 @@ from opencode_compat_hook.hook import (
     OpencodeCompatHandler,
     _coerce_value_for_schema,
     _deployment_api_base,
+    _estimate_count_tokens,
     _hoist_system_chat_messages,
     _hoist_system_responses_input,
     _iter_with_keepalive,
@@ -17,6 +18,12 @@ from opencode_compat_hook.hook import (
     _request_tool_schemas,
     _server_info_lacks_grammar,
     _server_info_url,
+    _truncate_stop_hook_history,
+)
+
+from opencode_compat_hook.hook import (
+    STOP_HOOK_HISTORY_HEAD_MAX_TOKENS,
+    STOP_HOOK_HISTORY_TAIL_MAX_TOKENS,
 )
 
 
@@ -202,6 +209,32 @@ async def anthropic_thinking_then_text_stream(thinking_chunks, text_chunks):
     yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
+async def anthropic_text_with_block_stop_stream(chunks):
+    yield (
+        'event: message_start\ndata: {"type":"message_start","message":'
+        '{"id":"msg_test","type":"message","role":"assistant","model":"test",'
+        '"content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    ).encode()
+    yield (
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+        '"content_block":{"type":"text","text":""}}\n\n'
+    ).encode()
+    for chunk in chunks:
+        yield (
+            "event: content_block_delta\ndata: "
+            + '{"type":"content_block_delta","index":0,"delta":'
+            + '{"type":"text_delta","text":'
+            + json.dumps(chunk)
+            + "}}\n\n"
+        ).encode()
+    yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    yield (
+        'event: message_delta\ndata: {"type":"message_delta","delta":'
+        '{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
+    ).encode()
+    yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+
 async def anthropic_text_in_content_block_start_stream(text):
     yield (
         'event: message_start\ndata: {"type":"message_start","message":'
@@ -221,6 +254,28 @@ async def anthropic_text_in_content_block_start_stream(text):
         '{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
     ).encode()
     yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+
+async def openai_text_stream(chunks, finish_reason="stop"):
+    yield (
+        'data: {"id":"chatcmpl_test","object":"chat.completion.chunk","model":"test",'
+        '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
+        '"finish_reason":null}]}\n\n'
+    ).encode()
+    for chunk in chunks:
+        yield (
+            'data: {"id":"chatcmpl_test","object":"chat.completion.chunk","model":"test",'
+            '"choices":[{"index":0,"delta":{"content":'
+            + json.dumps(chunk)
+            + '},"finish_reason":null}]}\n\n'
+        ).encode()
+    yield (
+        'data: {"id":"chatcmpl_test","object":"chat.completion.chunk","model":"test",'
+        '"choices":[{"index":0,"delta":{},"finish_reason":"'
+        + finish_reason
+        + '"}]}\n\n'
+    ).encode()
+    yield b"data: [DONE]\n\n"
 
 
 async def anthropic_stream_with_transparent_retry():
@@ -583,6 +638,99 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["merge_reasoning_content_in_choices"])
 
+    def _build_stop_hook_history(self, count, condition_index=0, content_size=500):
+        messages = []
+        padding = "x" * content_size
+        for index in range(count):
+            if index == condition_index:
+                content = (
+                    '{"hook_event_name":"Stop"} Check the stopping condition '
+                    "and return JSON. ARGUMENTS follow."
+                )
+            else:
+                content = f"user message {index} {padding}"
+            messages.append(
+                {
+                    "role": "assistant" if index % 2 == 1 else "user",
+                    "content": content,
+                }
+            )
+        return messages
+
+    def test_truncate_stop_hook_history_keeps_head_and_tail(self):
+        messages = self._build_stop_hook_history(80, content_size=500)
+        data = {"messages": list(messages)}
+
+        dropped = _truncate_stop_hook_history(data)
+
+        self.assertGreater(dropped, 0)
+        self.assertEqual(data["messages"][0], messages[0])
+        self.assertEqual(data["messages"][-1], messages[-1])
+        kept = data["messages"]
+        budget = STOP_HOOK_HISTORY_HEAD_MAX_TOKENS + STOP_HOOK_HISTORY_TAIL_MAX_TOKENS
+        self.assertLessEqual(sum(_estimate_count_tokens(m) for m in kept), budget + 300)
+
+    def test_truncate_stop_hook_history_drops_only_middle(self):
+        messages = self._build_stop_hook_history(80, content_size=500)
+        data = {"messages": list(messages)}
+
+        dropped = _truncate_stop_hook_history(data)
+
+        kept = data["messages"]
+        self.assertEqual(dropped, len(messages) - len(kept))
+        head = next((i for i, m in enumerate(kept) if m != messages[i]), len(kept))
+        tail = len(kept) - head
+        self.assertLess(head, len(kept))
+        self.assertEqual(kept[:head], messages[:head])
+        self.assertEqual(kept[head:], messages[len(messages) - tail:])
+
+    def test_truncate_stop_hook_history_keeps_condition_prompt(self):
+        messages = self._build_stop_hook_history(80, condition_index=40, content_size=500)
+        data = {"messages": list(messages)}
+
+        dropped = _truncate_stop_hook_history(data)
+
+        self.assertGreater(dropped, 0)
+        kept_text = " ".join(
+            m.get("content", "") if isinstance(m.get("content"), str) else ""
+            for m in data["messages"]
+        )
+        self.assertIn("stopping condition", kept_text)
+        self.assertIn("hook_event_name", kept_text)
+
+    def test_truncate_stop_hook_history_keeps_condition_prompt_in_tail(self):
+        messages = self._build_stop_hook_history(80, condition_index=79, content_size=500)
+        data = {"messages": list(messages)}
+
+        dropped = _truncate_stop_hook_history(data)
+
+        self.assertGreater(dropped, 0)
+        self.assertEqual(data["messages"][-1]["content"], messages[79]["content"])
+
+    def test_truncate_stop_hook_history_short_history_untouched(self):
+        messages = self._build_stop_hook_history(5, content_size=10)
+        data = {"messages": list(messages)}
+
+        dropped = _truncate_stop_hook_history(data)
+
+        self.assertEqual(dropped, 0)
+        self.assertEqual(data["messages"], messages)
+
+    async def test_pre_call_hook_truncates_stop_hook_history(self):
+        request_data = stop_hook_request()
+        request_data["messages"] = self._build_stop_hook_history(80, content_size=500)
+
+        result = await self.handler.async_pre_call_hook(
+            None,
+            None,
+            request_data,
+            "anthropic_messages",
+        )
+
+        self.assertGreater(len(result["messages"]), 0)
+        self.assertLess(len(result["messages"]), 80)
+        self.assertFalse(result["merge_reasoning_content_in_choices"])
+
     def test_stop_hook_deployment_capability_helpers(self):
         self.assertEqual(
             _deployment_api_base({"litellm_params": {"api_base": "http://pgc2:9527/v1/"}}),
@@ -872,6 +1020,109 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("stopping condition is not proven satisfied", decision["reason"])
         self.assertIn('"stop_reason": "end_turn"', rendered)
         record_fallback.assert_called_once()
+
+    async def test_unclosed_think_with_content_ends_well_formed_at_message_delta(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream(["<think>internal reasoning never closed"]),
+            request_context="test-unclosed-think-end",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertIn("internal reasoning never closed", emitted_text(rendered))
+        self.assertNotIn("<think>", rendered)
+
+    async def test_unclosed_think_with_content_ends_well_formed_at_finish_reason(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            openai_text_stream(["<think>internal reasoning never closed"]),
+            request_context="test-unclosed-think-finish",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertIn("internal reasoning never closed", emitted_text(rendered))
+        self.assertNotIn("<think>", rendered)
+
+    async def test_empty_unclosed_think_emits_placeholder_at_message_delta(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_stream(["<think>"]),
+            request_context="test-empty-unclosed-think",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertEqual(emitted_text(rendered), ".")
+        self.assertNotIn("<think>", rendered)
+
+    async def test_empty_unclosed_think_emits_placeholder_at_finish_reason(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            openai_text_stream(["<think>"]),
+            request_context="test-empty-unclosed-think-finish",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertEqual(emitted_text(rendered), ".")
+        self.assertNotIn("<think>", rendered)
+
+    async def test_empty_unclosed_think_placeholder_with_closed_text_block(self):
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_text_with_block_stop_stream(["<think>"]),
+            request_context="test-empty-unclosed-think-closed-block",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        text = emitted_text(rendered)
+        self.assertEqual(text, ".")
+        block_starts = rendered.count("event: content_block_start\n")
+        block_stops = rendered.count("event: content_block_stop\n")
+        self.assertEqual(block_starts, 2)
+        self.assertEqual(block_stops, 2)
+        text_delta_lines = [
+            line
+            for line in rendered.splitlines()
+            if line.startswith("data: ")
+            and (json.loads(line[6:]).get("delta") or {}).get("type") == "text_delta"
+        ]
+        for line in text_delta_lines:
+            index = json.loads(line[6:]).get("index")
+            self.assertEqual(index, 1)
+
+    async def test_revealed_thinking_ends_well_formed_without_placeholder(self):
+        output = []
+        with patch(
+            "opencode_compat_hook.hook.time.time",
+            side_effect=[1_700_000_000.0] + [1_700_000_040.0] * 100,
+        ):
+            async for item in self.handler._convert_anthropic_messages_stream(
+                anthropic_text_stream(["<think>long revealed reasoning"]),
+                request_context="test-revealed-end",
+                request_data={"call_type": "anthropic_messages", "stream": True},
+            ):
+                output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(rendered.count("event: message_stop\n"), 1)
+        self.assertIn('"stop_reason":"end_turn"', rendered)
+        text = emitted_text(rendered)
+        self.assertIn("long revealed reasoning", text)
+        self.assertNotIn("<think>", rendered)
 
 
 if __name__ == "__main__":
