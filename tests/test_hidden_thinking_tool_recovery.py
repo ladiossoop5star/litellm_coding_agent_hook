@@ -664,6 +664,52 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content_block_start_indexes(rendered), [0])
         self.assertEqual(emitted_text(rendered), valid_json)
 
+    async def test_forwarded_thinking_does_not_dump_preview_as_text(self):
+        thinking = "let me consider the ring buffer design carefully"
+        answer = "The answer is 42."
+        output = []
+        async for item in self.handler._convert_anthropic_messages_stream(
+            anthropic_thinking_then_text_stream([thinking], [answer]),
+            request_context="test-thinking-no-preview-dump",
+            request_data={"call_type": "anthropic_messages", "stream": True},
+        ):
+            output.append(item.decode() if isinstance(item, bytes) else str(item))
+
+        rendered = "".join(output)
+        self.assertEqual(emitted_text(rendered), answer)
+        self.assertIn("thinking_delta", rendered)
+        self.assertIn("ring buffer design", rendered)
+
+    async def test_thinking_delta_is_never_revealed_as_text(self):
+        async def feed_typed(chunk, delta_type, current):
+            out = []
+            async for item in self.handler._handle_messages_text_delta(
+                chunk, 0, b"", delta_type, current
+            ):
+                if isinstance(item, dict) and item.get("_state"):
+                    current = {
+                        "text_buffer": item["text_buffer"],
+                        "unflushed_text": item["unflushed_text"],
+                        "pending": item["pending"],
+                        "dsml_mode": item["dsml_mode"],
+                        "raw_think": item["raw_think"],
+                    }
+                else:
+                    out.append(item.decode() if isinstance(item, bytes) else str(item))
+            return "".join(out), current
+
+        out1, current = await feed_typed("thinking part one", "thinking_delta", state())
+        current["raw_think"]["started_at"] = time.time() - 31
+        out2, _ = await feed_typed("thinking part two", "thinking_delta", current)
+
+        self.assertIn("thinking_delta", out1)
+        self.assertNotIn("text_delta", out1)
+        self.assertIn("thinking_delta", out2)
+        self.assertIn("thinking part two", out2)
+        self.assertNotIn("text_delta", out2)
+        # the 30s reveal must not re-emit earlier thinking as visible text
+        self.assertNotIn("thinking part one", out2)
+
     async def test_orphan_parameter_close_triggers_malformed_fallback(self):
         output = []
         async for item in self.handler._convert_anthropic_messages_stream(
