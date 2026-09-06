@@ -29,70 +29,11 @@ def update_usage_obj(usage_obj, input_tokens):
         in_tokens = getattr(usage_obj, "input_tokens", None) or getattr(usage_obj, "prompt_tokens", None) or 0
         setattr(usage_obj, "total_tokens", int(in_tokens) + int(out_tokens))
 
-def clean_tools(tools):
-    if not isinstance(tools, list):
-        return tools
-    
-    cleaned = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            cleaned.append(tool)
-            continue
-        
-        t_type = tool.get("type")
-        if t_type == "function":
-            if "function" in tool:
-                cleaned.append(tool)
-            elif "name" in tool:
-                wrapped = {
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name"),
-                        "description": tool.get("description"),
-                        "parameters": tool.get("parameters"),
-                    }
-                }
-                if "strict" in tool:
-                    wrapped["function"]["strict"] = tool["strict"]
-                cleaned.append(wrapped)
-            else:
-                cleaned.append(tool)
-        elif t_type == "namespace":
-            nested_tools = tool.get("tools", [])
-            if isinstance(nested_tools, list):
-                for nt in nested_tools:
-                    if not isinstance(nt, dict):
-                        continue
-                    name = nt.get("name")
-                    if name:
-                        wrapped = {
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "description": nt.get("description"),
-                                "parameters": nt.get("parameters"),
-                            }
-                        }
-                        if "strict" in nt:
-                            wrapped["function"]["strict"] = nt["strict"]
-                        cleaned.append(wrapped)
-        elif t_type == "custom":
-            pass
-        else:
-            pass
-    return cleaned
-
 class ResponseUsageCallback(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         """
         在請求發送前，預先計算 input tokens
         """
-        try:
-            if isinstance(data, dict) and "tools" in data:
-                data["tools"] = clean_tools(data["tools"])
-        except Exception:
-            pass
-
         try:
             model = data.get("model", "")
             messages = data.get("messages", []) or data.get("input", []) or []
