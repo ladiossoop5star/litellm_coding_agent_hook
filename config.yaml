@@ -1,12 +1,17 @@
 # =========================================================================
 # ⚠️ DEPLOYMENT & ENVIRONMENT WORKFLOW POLICY
 # =========================================================================
+# - spark1 (Local Host / 10.115.140.130): 實驗/開發環境 (Dev/Experimental)。
+#   所有的設定檔更新、參數調整與 Hot Patch 驗證均必須先在此主機完成。
+# - spark3 (Remote Host / 10.115.140.188): 正式服務環境 (Production/Prod)。
+#   本機 spark1 驗證無誤後，方可同步並部署至 spark3 主機。
+# =========================================================================
 
 model_list:
-  - model_name: model-1
+  - model_name: glm-spark3
     litellm_params:
-      model: openai/model-1
-      api_base: http://10.1.1.1:9527/v1
+      model: openai/glm-5.2
+      api_base: http://10.115.140.188:9527/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
@@ -18,10 +23,27 @@ model_list:
       max_input_tokens: 287232
       max_output_tokens: 32768
 
-  - model_name: model-2
+  - model_name: qwen-pgc2
     litellm_params:
-      model: openai/model-2
-      api_base: http://10.1.1.2:9527/v1
+      model: openai/qwen-3.6-27b
+      #model: openai/laguna-s-2.1
+      #model: openai/ling-3
+      api_base: http://10.115.140.137:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: false
+    model_info:
+      max_tokens: 200000
+      max_input_tokens: 167232
+      max_output_tokens: 32768
+
+  - model_name: deepseek-spark1
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: http://10.115.140.130:9527/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
@@ -33,11 +55,79 @@ model_list:
       max_input_tokens: 467232
       max_output_tokens: 32768
 
+  - model_name: qwen-pgc1
+    litellm_params:
+      model: openai/qwen3.6_35ba3b
+      api_base: http://10.115.140.89:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 262144
+      max_input_tokens: 229376
+      max_output_tokens: 32768
+
+### The following has been omitted.
+  - model_name: qwen-spark1
+    litellm_params:
+      model: openai/qwen3.6-27b
+      api_base: http://10.115.140.130:8004/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 262144
+      max_input_tokens: 229376
+      max_output_tokens: 32768
+
+  - model_name: deepseek-spark3
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: http://10.115.140.188:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 524288
+      max_input_tokens: 491520
+      max_output_tokens: 32768
+
+  - model_name: deepseek-spark5
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: http://10.115.140.132:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 524288
+      max_input_tokens: 491520
+      max_output_tokens: 32768
+
 router_settings:
   model_group_alias:
-    claude-haiku-4-5-20251001: model-1
-    claude-sonnet-4-6: model-1
-    claude-opus-4-6: model-2
+#    claude-haiku-4-5-20251001: qwen-spark1
+#    claude-sonnet-4-6: qwen-pgc1
+    claude-haiku-4-5-20251001: deepseek-spark1
+    claude-sonnet-4-6: deepseek-spark1
+    claude-sonnet-4-5-20250929: qwen-pgc2
+#    claude-opus-4-8: deepseek-spark3
+#    claude-opus-4-7: deepseek-spark5
+    claude-opus-4-8: qwen-pgc1
+#    claude-opus-4-7: deepseek-spark1
+    claude-opus-4-6: glm-spark3
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

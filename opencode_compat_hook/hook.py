@@ -1328,6 +1328,7 @@ def _raw_think_state() -> Dict[str, Any]:
         "started_at": None,
         "suppressed_chars": 0,
         "suppressed_chunks": 0,
+        "forwarded_thinking_chars": 0,
         "preview": "",
         "visible_chars": 0,
         "warned_unclosed": False,
@@ -3705,13 +3706,14 @@ class OpencodeCompatHandler(CustomLogger):
         if delta_type == "thinking_delta":
             if raw_think.get("started_at") is None:
                 raw_think["started_at"] = time.time()
-            if _should_reveal_hidden_thinking(raw_think):
-                visible_text = _hidden_thinking_reveal_prefix(raw_think) + text
-                raw_think["visible_chars"] = int(raw_think.get("visible_chars") or 0) + len(visible_text)
-                yield _messages_text_delta(visible_text, text_block_index, original, "text_delta")
-            else:
-                _record_raw_think_suppressed(text, raw_think)
-                yield _messages_text_delta(text, text_block_index, original, "thinking_delta")
+            # Structured thinking deltas are already visible to the client as a
+            # thinking block. They must not count as suppressed hidden thinking:
+            # the reveal path would duplicate them into the visible answer text
+            # and the final fallback would dump the preview into the transcript.
+            raw_think["forwarded_thinking_chars"] = (
+                int(raw_think.get("forwarded_thinking_chars") or 0) + len(text)
+            )
+            yield _messages_text_delta(text, text_block_index, original, "thinking_delta")
             yield {
                 "_state": True,
                 "text_buffer": text_buffer,
