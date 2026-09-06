@@ -8,10 +8,10 @@
 # =========================================================================
 
 model_list:
-  - model_name: qwen-pgc2
+  - model_name: glm-spark3
     litellm_params:
-      model: openai/qwen3.6-27b-ud-q8-xl
-      api_base: http://10.115.140.137:9526/v1
+      model: openai/glm-5.2
+      api_base: http://10.115.140.188:9527/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
@@ -19,14 +19,62 @@ model_list:
 
       merge_reasoning_content_in_choices: true
     model_info:
+      max_tokens: 320000
+      max_input_tokens: 287232
+      max_output_tokens: 32768
+
+  - model_name: qwen-pgc2
+    litellm_params:
+      model: openai/qwen-3.6-27b
+      #model: openai/laguna-s-2.1
+      #model: openai/ling-3
+      api_base: http://10.115.140.137:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: false
+    model_info:
       max_tokens: 200000
       max_input_tokens: 167232
       max_output_tokens: 32768
 
+  - model_name: deepseek-spark1
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: http://10.115.140.130:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 500000
+      max_input_tokens: 467232
+      max_output_tokens: 32768
+
+  - model_name: qwen-pgc1
+    litellm_params:
+      model: openai/qwen3.6_35ba3b
+      api_base: http://10.115.140.89:9527/v1
+      api_key: dummy
+      custom_endpoint: true
+      use_chat_completions_api: true
+      max_tokens: 32768
+
+      merge_reasoning_content_in_choices: true
+    model_info:
+      max_tokens: 262144
+      max_input_tokens: 229376
+      max_output_tokens: 32768
+
+### The following has been omitted.
   - model_name: qwen-spark1
     litellm_params:
       model: openai/qwen3.6-27b
-      api_base: http://10.115.140.130:9526/v1
+      api_base: http://10.115.140.130:8004/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
@@ -41,17 +89,17 @@ model_list:
   - model_name: deepseek-spark3
     litellm_params:
       model: openai/deepseek-v4-flash
-      api_base: http://10.115.140.188:8000/v1
+      api_base: http://10.115.140.188:9527/v1
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
-      max_tokens: 65536
+      max_tokens: 32768
 
       merge_reasoning_content_in_choices: true
     model_info:
       max_tokens: 524288
-      max_input_tokens: 458752
-      max_output_tokens: 65536
+      max_input_tokens: 491520
+      max_output_tokens: 32768
 
   - model_name: deepseek-spark5
     litellm_params:
@@ -60,25 +108,34 @@ model_list:
       api_key: dummy
       custom_endpoint: true
       use_chat_completions_api: true
-      max_tokens: 65536
+      max_tokens: 32768
 
       merge_reasoning_content_in_choices: true
     model_info:
-      max_tokens: 1000000
-      max_input_tokens: 934464
-      max_output_tokens: 65536
+      max_tokens: 524288
+      max_input_tokens: 491520
+      max_output_tokens: 32768
 
 router_settings:
   model_group_alias:
-    claude-haiku-4-5-20251001: qwen-spark1
-    claude-sonnet-4-6: qwen-spark1
-    claude-opus-4-8: deepseek-spark3
-    claude-opus-4-7: deepseek-spark5
+#    claude-haiku-4-5-20251001: qwen-spark1
+#    claude-sonnet-4-6: qwen-pgc1
+    claude-haiku-4-5-20251001: deepseek-spark1
+    claude-sonnet-4-6: deepseek-spark1
+    claude-sonnet-4-5-20250929: qwen-pgc2
+#    claude-opus-4-8: deepseek-spark3
+#    claude-opus-4-7: deepseek-spark5
+    claude-opus-4-8: qwen-pgc1
+#    claude-opus-4-7: deepseek-spark1
+    claude-opus-4-6: glm-spark3
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
 
 litellm_settings:
+  callbacks:
+    - opencode_compat_hook.hook.proxy_handler_instance
   drop_params: true
+  set_content_as_str: true
   set_verbose: false
   use_chat_completions_url_for_anthropic_messages: true

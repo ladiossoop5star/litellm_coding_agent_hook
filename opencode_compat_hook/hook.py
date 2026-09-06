@@ -1,0 +1,3886 @@
+import asyncio
+import fcntl
+import json
+import logging
+import re
+import time
+import uuid
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
+
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.types.utils import ModelResponseStream
+
+from opencode_compat_hook.parser import (
+    RAW_TOOL_OPEN_MARKERS,
+    find_raw_tool_start,
+    has_any_dsml_prefix,
+    has_complete_raw_tool_block,
+    normalize_raw_tool_calls,
+    parse_raw_tool_calls,
+)
+
+
+log = logging.getLogger("opencode_compat_hook")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s - opencode_compat_hook - %(levelname)s - %(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+
+SECTION_SIZE = 32
+GUARD_SECTIONS = 2
+ASSISTANT_PLACEHOLDER = "."
+STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER = "deepseek"
+RAW_THINK_PREVIEW_LIMIT = 200
+MESSAGES_STREAM_KEEPALIVE_SECONDS = 15.0
+MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
+UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS = 2.0
+UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
+REVEAL_HIDDEN_THINKING_AFTER_SECONDS = 30.0
+STOP_HOOK_KEEPALIVE_SECONDS = 5.0
+STOP_HOOK_JSON_FALLBACK_SECONDS = 25.0
+STOP_HOOK_JSON_PROGRESS_GRACE_SECONDS = 15.0
+STOP_HOOK_JSON_ACTIVE_MAX_SECONDS = 120.0
+STOP_HOOK_CAPABILITY_CACHE_SECONDS = 30.0
+STOP_HOOK_CAPABILITY_ERROR_CACHE_SECONDS = 5.0
+STOP_HOOK_CAPABILITY_TIMEOUT_SECONDS = 0.5
+NESTED_REQUEST_SCAN_MAX_DEPTH = 64
+STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE = 5
+STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS = 30 * 60
+STOP_HOOK_HISTORY_HEAD_MAX_TOKENS = 2048
+STOP_HOOK_HISTORY_TAIL_MAX_TOKENS = 4096
+# Stop hook evaluator streams suppress every upstream content frame, so the
+# synthesized decision block is always the first client-visible content block
+# and must use index 0. Reusing the upstream block index (e.g. 2 after two
+# suppressed thinking blocks) leaves gaps that strict clients reject as
+# "empty or malformed response (HTTP 200)".
+STOP_HOOK_CLIENT_BLOCK_INDEX = 0
+COUNT_TOKENS_NATIVE_MAX_ESTIMATE = 8192
+_RESPONSES_EMPTY_TOOLS_PATCHED = False
+_RESPONSES_REASONING_TEXT_PATCHED = False
+_STOP_HOOK_JSON_FALLBACK_COUNTS_PATH = "/tmp/opencode_compat_stop_hook_fallback_counts.json"
+_STOP_HOOK_JSON_FALLBACK_COUNTS: Dict[str, int] = {}
+_STOP_HOOK_REQUEST_STARTED_AT: Dict[str, float] = {}
+
+
+def _deployment_api_base(request_data: Optional[dict]) -> str:
+    if not isinstance(request_data, dict):
+        return ""
+    candidates = [request_data.get("api_base")]
+    for key in ("litellm_params", "metadata", "litellm_metadata"):
+        nested = request_data.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested.get("api_base"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+            return candidate.rstrip("/")
+    return ""
+
+
+def _server_info_url(api_base: str) -> str:
+    try:
+        parsed = urlsplit(api_base)
+    except Exception:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    return urlunsplit((parsed.scheme, parsed.netloc, path + "/get_server_info", "", ""))
+
+
+def _server_info_fingerprint(server_info: dict) -> Tuple[str, ...]:
+    return tuple(
+        str(server_info.get(key) or "")
+        for key in (
+            "model_path",
+            "served_model_name",
+            "weight_version",
+            "speculative_algorithm",
+            "version",
+        )
+    )
+
+
+def _server_info_lacks_grammar(server_info: Any) -> bool:
+    if not isinstance(server_info, dict):
+        return False
+    # Current SGLang DFLASH rejects every grammar-constrained request. This is
+    # deployment capability detection, not a model-name allow/deny list.
+    algorithm = str(server_info.get("speculative_algorithm") or "").upper()
+    return algorithm == "DFLASH"
+
+
+def _remove_stop_hook_structured_output(request_data: dict) -> bool:
+    changed = request_data.pop("response_format", None) is not None
+    output_config = request_data.get("output_config")
+    if isinstance(output_config, dict):
+        cleaned = dict(output_config)
+        for key in ("format", "response_format"):
+            value = cleaned.get(key)
+            if value is not None and _has_stop_hook_json_schema(value):
+                cleaned.pop(key, None)
+                changed = True
+        if cleaned:
+            request_data["output_config"] = cleaned
+        elif changed:
+            request_data.pop("output_config", None)
+    return changed
+
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _set(obj: Any, key: str, value: Any) -> None:
+    if isinstance(obj, dict):
+        obj[key] = value
+    else:
+        setattr(obj, key, value)
+
+
+def _choice(response: Any, index: int = 0) -> Any:
+    choices = _get(response, "choices", []) or []
+    if not choices or len(choices) <= index:
+        return None
+    return choices[index]
+
+
+def _message(choice: Any) -> Any:
+    return _get(choice, "message", {}) or {}
+
+
+def _delta(chunk: Any) -> Any:
+    choice = _choice(chunk)
+    if choice is None:
+        return {}
+    return _get(choice, "delta", {}) or {}
+
+
+def _content_from_delta(delta: Any) -> str:
+    return _get(delta, "content", "") or ""
+
+
+def _reasoning_from_delta(delta: Any) -> str:
+    return _get(delta, "reasoning", "") or _get(delta, "reasoning_content", "") or ""
+
+
+def _chunk_id(chunk: Any, fallback: str = "chatcmpl-opencode-compat") -> str:
+    return _get(chunk, "id", None) or fallback
+
+
+def _patch_tool_call_ids(delta: Any, state: Dict[Any, Dict[str, str]]) -> None:
+    tool_calls = _get(delta, "tool_calls", None)
+    if not tool_calls:
+        return
+
+    for position, tc in enumerate(tool_calls):
+        index = _get(tc, "index", None)
+        state_key = index if index is not None else position
+        tid = _get(tc, "id", None)
+        fn = _get(tc, "function", None)
+        name = _get(fn, "name", None) if fn is not None else None
+        entry = state.get(state_key)
+
+        if tid and (entry is None or entry.get("id") != tid):
+            entry = {"id": str(tid)}
+            state[state_key] = entry
+
+        if not tid:
+            if entry and entry.get("id"):
+                _set(tc, "id", entry["id"])
+            else:
+                tid = "call_" + uuid.uuid4().hex
+                _set(tc, "id", tid)
+                entry = {"id": tid}
+                state[state_key] = entry
+
+        if isinstance(name, str) and name:
+            if entry is None:
+                entry = {"id": str(_get(tc, "id", ""))}
+                state[state_key] = entry
+            entry["name"] = name
+        elif fn is not None and entry and entry.get("name"):
+            _set(fn, "name", entry["name"])
+
+
+def _chunk_model(chunk: Any, fallback: str = "unknown") -> str:
+    return _get(chunk, "model", None) or fallback
+
+
+def _chunk_created(chunk: Any, fallback: Optional[int] = None) -> int:
+    return _get(chunk, "created", None) or fallback or int(time.time())
+
+
+def _make_stream_chunk(
+    chunk_id: str,
+    model: str,
+    created: int,
+    delta: Dict[str, Any],
+    finish_reason: Optional[str] = None,
+) -> ModelResponseStream:
+    return ModelResponseStream(
+        id=chunk_id,
+        object="chat.completion.chunk",
+        created=created,
+        model=model,
+        choices=[{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    )
+
+
+def _make_content_chunk(chunk_id: str, model: str, created: int, text: str) -> ModelResponseStream:
+    return _make_stream_chunk(chunk_id, model, created, {"content": text})
+
+
+def build_stream_tool_call_chunks(
+    tool_calls: Iterable[Dict[str, Any]], chunk_id: str, model: str, created: int
+) -> List[ModelResponseStream]:
+    chunks: List[ModelResponseStream] = []
+    for tc in tool_calls:
+        fn = tc["function"]
+        chunks.append(
+            _make_stream_chunk(
+                chunk_id,
+                model,
+                created,
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": fn["name"], "arguments": ""},
+                        }
+                    ]
+                },
+            )
+        )
+        args = fn["arguments"]
+        for i in range(0, len(args), SECTION_SIZE):
+            chunks.append(
+                _make_stream_chunk(
+                    chunk_id,
+                    model,
+                    created,
+                    {"tool_calls": [{"index": 0, "function": {"arguments": args[i:i + SECTION_SIZE]}}]},
+                )
+            )
+
+    chunks.append(_make_stream_chunk(chunk_id, model, created, {"content": ""}, finish_reason="tool_calls"))
+    return chunks
+
+
+def _request_url(request_data: Optional[dict]) -> str:
+    if not request_data:
+        return ""
+    proxy_request = request_data.get("proxy_server_request") or {}
+    if isinstance(proxy_request, dict):
+        return str(proxy_request.get("url") or "")
+    return ""
+
+
+def _is_messages_stream(request_data: Optional[dict]) -> bool:
+    if not request_data:
+        return False
+    call_type = str(request_data.get("call_type") or "")
+    if call_type == "anthropic_messages":
+        return True
+    url = _request_url(request_data)
+    return "/v1/messages" in url or "/messages" in url
+
+
+def _should_skip_stream_conversion(request_data: Optional[dict]) -> bool:
+    if not request_data:
+        return False
+
+    call_type = str(request_data.get("call_type") or "")
+    if call_type in {"pass_through_endpoint", "responses", "aresponses"}:
+        return True
+
+    return False
+
+
+def _request_model_names(request_data: Optional[dict]) -> set[str]:
+    if not request_data:
+        return set()
+    metadata = request_data.get("litellm_metadata") or {}
+    values = {
+        request_data.get("model"),
+        metadata.get("model_group"),
+        metadata.get("deployment"),
+        metadata.get("deployment_model_name"),
+    }
+    return {str(value) for value in values if value}
+
+
+def _stop_after_first_native_tool(request_data: Optional[dict]) -> bool:
+    if _is_messages_stream(request_data):
+        return True
+    return any(STOP_AFTER_FIRST_NATIVE_TOOL_MODEL_MARKER in name.lower() for name in _request_model_names(request_data))
+
+
+def convert_non_streaming_response(response: Any, tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None) -> Any:
+    if isinstance(response, dict) and isinstance(response.get("content"), list):
+        return _convert_anthropic_message_response(response, tool_schemas)
+
+    choice = _choice(response)
+    if choice is None:
+        return response
+
+    msg = _message(choice)
+    content = _get(msg, "content", "") or ""
+    reasoning = _get(msg, "reasoning_content", "") or _get(msg, "reasoning", "") or ""
+    tool_calls = _get(msg, "tool_calls", None)
+    raw_text = content or reasoning
+
+    if tool_calls or not raw_text or not has_complete_raw_tool_block(raw_text):
+        return response
+
+    parsed = parse_raw_tool_calls(normalize_raw_tool_calls(raw_text))
+    if not parsed:
+        log.warning("raw tool block detected but parse returned empty: %s", raw_text[:600])
+        return response
+
+    _coerce_tool_arguments_for_schemas(parsed, tool_schemas or {})
+    _set(msg, "tool_calls", parsed)
+    _set(msg, "content", None)
+    if reasoning:
+        _set(msg, "reasoning_content", None)
+    _set(choice, "finish_reason", "tool_calls")
+    log.info("converted %d non-stream tool_calls", len(parsed))
+    return response
+
+
+def _tool_input(arguments: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(arguments or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _convert_anthropic_message_response(
+    response: Dict[str, Any], tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    content = response.get("content") or []
+    if not isinstance(content, list):
+        return response
+
+    for index, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        text = block.get("thinking") if block.get("type") == "thinking" else block.get("text")
+        if not isinstance(text, str) or not has_complete_raw_tool_block(text):
+            continue
+
+        parsed = parse_raw_tool_calls(normalize_raw_tool_calls(text))
+        if not parsed:
+            log.warning("anthropic raw tool block detected but parse returned empty: %s", text[:600])
+            return response
+
+        _coerce_tool_arguments_for_schemas(parsed, tool_schemas or {})
+        raw_start = find_raw_tool_start(text)
+        prefix = text[:raw_start].rstrip()
+        new_content: List[Dict[str, Any]] = []
+        new_content.extend(content[:index])
+        if prefix:
+            new_block = dict(block)
+            if new_block.get("type") == "thinking":
+                new_block["thinking"] = prefix
+            else:
+                new_block["text"] = prefix
+            new_content.append(new_block)
+
+        for tc in parsed:
+            fn = tc["function"]
+            new_content.append(
+                {
+                    "type": "tool_use",
+                    "id": tc.get("id") or "toolu_" + uuid.uuid4().hex[:24],
+                    "name": fn["name"],
+                    "input": _tool_input(fn.get("arguments") or "{}"),
+                }
+            )
+
+        response["content"] = new_content
+        response["stop_reason"] = "tool_use"
+        log.info("converted %d anthropic non-stream tool_use blocks", len(parsed))
+        return response
+
+    return response
+
+
+def _has_anthropic_text_or_tool_use(content: List[Any]) -> bool:
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "tool_use":
+            return True
+        if part_type == "text" and str(part.get("text") or "").strip():
+            return True
+    return False
+
+
+def _normalize_assistant_messages(messages: Any) -> None:
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+
+        content = msg.get("content")
+        if isinstance(content, list):
+            if not _has_anthropic_text_or_tool_use(content):
+                content.append({"type": "text", "text": ASSISTANT_PLACEHOLDER})
+            continue
+
+        if not content and not msg.get("tool_calls"):
+            msg["content"] = ASSISTANT_PLACEHOLDER
+
+
+def _chat_function_tool_from_responses_tool(tool: Dict[str, Any]) -> Dict[str, Any]:
+    parameters = tool.get("parameters") or {}
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object"}
+    if "type" not in parameters:
+        parameters = {**parameters, "type": "object"}
+    return {
+        "type": "function",
+        "function": {
+            "name": str(tool.get("name") or ""),
+            "description": str(tool.get("description") or ""),
+            "parameters": parameters,
+            "strict": bool(tool.get("strict", False)),
+        },
+    }
+
+
+def _sanitize_response_tools_for_litellm(tools: Any) -> Any:
+    if not isinstance(tools, list):
+        return tools
+    return [tool for tool in tools if isinstance(tool, dict) and tool.get("type") == "function"]
+
+
+def _sanitize_chat_tools_for_upstream(tools: Any) -> Any:
+    if not isinstance(tools, list):
+        return tools
+
+    sanitized = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        if isinstance(tool.get("function"), dict):
+            sanitized.append(tool)
+            continue
+        if tool.get("name"):
+            sanitized.append(_chat_function_tool_from_responses_tool(tool))
+    return sanitized
+
+
+def _sanitize_request_tools(data: dict, call_type: str) -> None:
+    if not isinstance(data, dict):
+        return
+
+    if call_type in ("responses", "aresponses") and _is_codex_compaction_request(data):
+        _disable_tools_for_compaction(data)
+        return
+
+    if isinstance(data.get("tools"), list):
+        if call_type in ("responses", "aresponses"):
+            data["tools"] = _sanitize_response_tools_for_litellm(data["tools"])
+        elif call_type in ("completion", "acompletion", "chat_completion"):
+            data["tools"] = _sanitize_chat_tools_for_upstream(data["tools"])
+        if isinstance(data.get("tools"), list) and not data["tools"]:
+            _drop_empty_tools(data)
+
+    optional_params = data.get("optional_params")
+    if (
+        call_type in ("responses", "aresponses", "completion", "acompletion", "chat_completion")
+        and isinstance(optional_params, dict)
+        and isinstance(optional_params.get("tools"), list)
+    ):
+        optional_params["tools"] = _sanitize_chat_tools_for_upstream(optional_params["tools"])
+        if not optional_params["tools"]:
+            _drop_empty_tools(optional_params)
+
+
+def _drop_empty_tools(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    if isinstance(payload.get("tools"), list) and not payload["tools"]:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+
+
+def _disable_tools_for_compaction(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    payload.pop("tools", None)
+    payload.pop("tool_choice", None)
+    payload["parallel_tool_calls"] = False
+
+    optional_params = payload.get("optional_params")
+    if isinstance(optional_params, dict):
+        optional_params.pop("tools", None)
+        optional_params.pop("tool_choice", None)
+        optional_params["parallel_tool_calls"] = False
+
+
+def _metadata_dicts(payload: Any) -> Iterable[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+
+    dicts: List[Dict[str, Any]] = [payload]
+    for key in ("metadata", "client_metadata", "litellm_metadata"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            dicts.append(value)
+
+    extra_body = payload.get("extra_body")
+    if isinstance(extra_body, dict):
+        dicts.append(extra_body)
+        client_metadata = extra_body.get("client_metadata")
+        if isinstance(client_metadata, dict):
+            dicts.append(client_metadata)
+
+    return dicts
+
+
+def _codex_turn_metadata(payload: Any) -> Dict[str, Any]:
+    for metadata in _metadata_dicts(payload):
+        raw = metadata.get("x-codex-turn-metadata")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _iter_response_input_text(input_value: Any) -> Iterable[str]:
+    if isinstance(input_value, str):
+        yield input_value
+        return
+
+    if not isinstance(input_value, list):
+        return
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            yield content
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text") or part.get("input_text")
+            if isinstance(text, str):
+                yield text
+
+
+def _strip_raw_think_from_history_text(text: str) -> str:
+    state = _raw_think_state()
+    visible = _strip_raw_think_delta(text, state)
+    visible += _flush_raw_think_tail(state)
+    if state.get("in_think"):
+        _warn_unclosed_raw_think(state, "responses-input-history")
+    return visible
+
+
+_INTERNAL_ARTIFACT_BLOCK_PATTERNS = (
+    re.compile(
+        r"<dcp-system-reminder\b[^>]*>.*?(?:</dcp-system-reminder>|</\uff5cDSML\uff5csystem-reminder>|</\|DSML\|system-reminder>)",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<system-reminder\b[^>]*>.*?</system-reminder>",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<(?:\uff5cDSML\uff5c|\|DSML\|)system-reminder\b[^>]*>.*?</(?:\uff5cDSML\uff5c|\|DSML\|)system-reminder>",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"<dcp-message-id\b[^>]*>.*?</dcp-message-id>",
+        re.DOTALL,
+    ),
+)
+
+
+def _strip_internal_artifacts_from_history_text(text: str) -> str:
+    cleaned = text
+    for pattern in _INTERNAL_ARTIFACT_BLOCK_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    return cleaned
+
+
+def _sanitize_content_text_parts(content: Any) -> Tuple[Any, bool]:
+    if isinstance(content, str):
+        cleaned = _strip_internal_artifacts_from_history_text(content)
+        return cleaned, cleaned != content
+
+    if not isinstance(content, list):
+        return content, False
+
+    changed = False
+    new_content: List[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            new_content.append(part)
+            continue
+
+        text_key = None
+        for candidate in ("text", "input_text"):
+            if isinstance(part.get(candidate), str):
+                text_key = candidate
+                break
+        if text_key is None:
+            new_content.append(part)
+            continue
+
+        cleaned = _strip_internal_artifacts_from_history_text(part[text_key])
+        if cleaned != part[text_key]:
+            changed = True
+            if not cleaned.strip():
+                continue
+            new_part = dict(part)
+            new_part[text_key] = cleaned
+            new_content.append(new_part)
+        else:
+            new_content.append(part)
+
+    return new_content, changed
+
+
+def _sanitize_chat_internal_artifact_history(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+
+    changed_parts = 0
+    removed_messages = 0
+    sanitized_messages: List[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            sanitized_messages.append(message)
+            continue
+
+        content = message.get("content")
+        cleaned_content, changed = _sanitize_content_text_parts(content)
+        if not changed:
+            sanitized_messages.append(message)
+            continue
+
+        changed_parts += 1
+        if isinstance(cleaned_content, str) and not cleaned_content.strip():
+            removed_messages += 1
+            continue
+        if isinstance(cleaned_content, list) and not cleaned_content:
+            removed_messages += 1
+            continue
+
+        new_message = dict(message)
+        new_message["content"] = cleaned_content
+        sanitized_messages.append(new_message)
+
+    if changed_parts or removed_messages:
+        payload["messages"] = sanitized_messages
+        log.warning(
+            "sanitized chat internal artifact history removed_messages=%s changed_parts=%s",
+            removed_messages,
+            changed_parts,
+        )
+
+
+def _sanitize_response_input_history(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    input_value = payload.get("input")
+    if not isinstance(input_value, list):
+        return
+
+    removed_items = 0
+    stripped_parts = 0
+    sanitized_items: List[Any] = []
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            sanitized_items.append(item)
+            continue
+        if item.get("role") != "assistant" or item.get("type") not in (None, "message"):
+            sanitized_items.append(item)
+            continue
+
+        content = item.get("content")
+        if isinstance(content, str):
+            cleaned = _strip_raw_think_from_history_text(content)
+            if cleaned.strip():
+                new_item = dict(item)
+                new_item["content"] = cleaned
+                sanitized_items.append(new_item)
+            else:
+                removed_items += 1
+            if cleaned != content:
+                stripped_parts += 1
+            continue
+
+        if not isinstance(content, list):
+            sanitized_items.append(item)
+            continue
+
+        new_content: List[Any] = []
+        for part in content:
+            if not isinstance(part, dict):
+                new_content.append(part)
+                continue
+            part_type = part.get("type")
+            if part_type not in {"output_text", "text", "input_text"}:
+                new_content.append(part)
+                continue
+            text = part.get("text")
+            if not isinstance(text, str):
+                new_content.append(part)
+                continue
+            cleaned = _strip_raw_think_from_history_text(text)
+            if cleaned != text:
+                stripped_parts += 1
+            if cleaned.strip():
+                new_part = dict(part)
+                new_part["text"] = cleaned
+                new_content.append(new_part)
+
+        if new_content:
+            new_item = dict(item)
+            new_item["content"] = new_content
+            sanitized_items.append(new_item)
+        else:
+            removed_items += 1
+
+    if removed_items or stripped_parts:
+        payload["input"] = sanitized_items
+        log.warning(
+            "sanitized responses input raw <think> history removed_items=%s stripped_parts=%s",
+            removed_items,
+            stripped_parts,
+        )
+
+
+def _disable_responses_reasoning_merge(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    payload["merge_reasoning_content_in_choices"] = False
+    optional_params = payload.get("optional_params")
+    if isinstance(optional_params, dict):
+        optional_params["merge_reasoning_content_in_choices"] = False
+
+
+def _model_group_names_from_payload(payload: Any) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    metadata = payload.get("litellm_metadata") or {}
+    values = {
+        payload.get("model"),
+        metadata.get("model_group"),
+        metadata.get("deployment"),
+        metadata.get("deployment_model_name"),
+    }
+    return {str(value).lower() for value in values if value}
+
+
+def _valid_tool_arguments_json(arguments: Any) -> bool:
+    if not isinstance(arguments, str):
+        return False
+    try:
+        json.loads(arguments)
+        return True
+    except Exception:
+        return False
+
+
+def _response_function_call_ids(item: Dict[str, Any]) -> set[str]:
+    return {str(value) for value in (item.get("call_id"), item.get("id")) if value}
+
+
+def _sanitize_malformed_function_call_history(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    input_value = payload.get("input")
+    if not isinstance(input_value, list):
+        return
+
+    bad_call_ids: set[str] = set()
+    malformed_calls = 0
+    for item in input_value:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        if _valid_tool_arguments_json(item.get("arguments")):
+            continue
+        malformed_calls += 1
+        bad_call_ids.update(_response_function_call_ids(item))
+
+    if not malformed_calls:
+        return
+
+    removed_outputs = 0
+    sanitized_items: List[Any] = []
+    for item in input_value:
+        if not isinstance(item, dict):
+            sanitized_items.append(item)
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call" and _response_function_call_ids(item) & bad_call_ids:
+            continue
+        if item_type == "function_call_output" and str(item.get("call_id") or "") in bad_call_ids:
+            removed_outputs += 1
+            continue
+        sanitized_items.append(item)
+
+    payload["input"] = sanitized_items
+    log.warning(
+        "sanitized malformed responses function_call history model=%s calls=%s outputs=%s",
+        ",".join(sorted(_model_group_names_from_payload(payload))) or "unknown",
+        malformed_calls,
+        removed_outputs,
+    )
+
+
+def _is_codex_compaction_request(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    turn_metadata = _codex_turn_metadata(payload)
+    if turn_metadata.get("request_kind") == "compaction":
+        return True
+    if isinstance(turn_metadata.get("compaction"), dict):
+        return True
+
+    marker = "CONTEXT CHECKPOINT COMPACTION"
+    return any(marker in text for text in _iter_response_input_text(payload.get("input")))
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: List[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text") or part.get("input_text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n\n".join(parts)
+
+
+def _hoist_system_chat_messages(messages: Any) -> int:
+    """Fold system/developer messages into a single leading system message.
+
+    The Qwen3.6 chat template raises 'System message must be at the beginning.'
+    for any system message not at index 0, and 'Unexpected message role.' for
+    developer messages. Returns the number of messages folded.
+    """
+    if not isinstance(messages, list) or not messages:
+        return 0
+    needs_fix = any(
+        isinstance(msg, dict)
+        and (msg.get("role") == "developer" or (msg.get("role") == "system" and index > 0))
+        for index, msg in enumerate(messages)
+    )
+    if not needs_fix:
+        return 0
+
+    texts: List[str] = []
+    rest: List[Any] = []
+    folded = 0
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") in ("system", "developer"):
+            folded += 1
+            text = _message_content_text(msg.get("content"))
+            if text:
+                texts.append(text)
+            continue
+        rest.append(msg)
+
+    if not texts:
+        if not rest:
+            return 0
+        messages[:] = rest
+        return folded
+    messages[:] = [{"role": "system", "content": "\n\n".join(texts)}] + rest
+    return folded
+
+
+def _hoist_system_responses_input(data: dict) -> int:
+    """Move system/developer input items into the instructions string.
+
+    LiteLLM's Responses->chat bridge turns `instructions` into the leading
+    system message and preserves item roles, so any system/developer item in
+    `input` lands mid-list and trips the Qwen3.6 chat template. Returns the
+    number of items folded.
+    """
+    input_value = data.get("input")
+    if not isinstance(input_value, list):
+        return 0
+
+    def is_instruction_item(item: Any) -> bool:
+        return (
+            isinstance(item, dict)
+            and item.get("role") in ("system", "developer")
+            and item.get("type") in (None, "message")
+        )
+
+    if not any(is_instruction_item(item) for item in input_value):
+        return 0
+
+    texts: List[str] = []
+    rest: List[Any] = []
+    for item in input_value:
+        if is_instruction_item(item):
+            text = _message_content_text(item.get("content"))
+            if text:
+                texts.append(text)
+        else:
+            rest.append(item)
+
+    instructions = data.get("instructions")
+    head = instructions.strip() if isinstance(instructions, str) else ""
+    merged = "\n\n".join(([head] if head else []) + texts)
+    data["instructions"] = merged
+    data["input"] = rest
+    return len(input_value) - len(rest)
+
+
+def _patch_litellm_responses_empty_tools_bridge() -> None:
+    global _RESPONSES_EMPTY_TOOLS_PATCHED
+
+    if _RESPONSES_EMPTY_TOOLS_PATCHED:
+        return
+
+    try:
+        from litellm.responses.litellm_completion_transformation.transformation import (
+            LiteLLMCompletionResponsesConfig,
+        )
+
+        original = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request
+        if getattr(original, "_opencode_empty_tools_patched", False):
+            _RESPONSES_EMPTY_TOOLS_PATCHED = True
+            return
+
+        def patched_transform(*args: Any, **kwargs: Any) -> dict:
+            completion_request = original(*args, **kwargs)
+            _drop_empty_tools(completion_request)
+            return completion_request
+
+        setattr(patched_transform, "_opencode_empty_tools_patched", True)
+        LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request = staticmethod(
+            patched_transform
+        )
+        _RESPONSES_EMPTY_TOOLS_PATCHED = True
+        log.info("patched LiteLLM Responses bridge to omit empty tools")
+    except Exception as exc:
+        log.warning("failed to patch LiteLLM Responses empty-tools bridge: %s", exc)
+
+
+def _patch_litellm_responses_reasoning_text_bridge() -> None:
+    global _RESPONSES_REASONING_TEXT_PATCHED
+
+    if _RESPONSES_REASONING_TEXT_PATCHED:
+        return
+
+    try:
+        from litellm.completion_extras.litellm_responses_transformation.transformation import (
+            OpenAiResponsesToChatCompletionStreamIterator,
+        )
+
+        original = OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream
+        if getattr(original, "_opencode_reasoning_text_patched", False):
+            _RESPONSES_REASONING_TEXT_PATCHED = True
+            return
+
+        def patched_translate(parsed_chunk: Any) -> ModelResponseStream:
+            chunk = parsed_chunk.model_dump() if hasattr(parsed_chunk, "model_dump") else parsed_chunk
+            if isinstance(chunk, dict) and chunk.get("type") == "response.reasoning_text.delta":
+                content_part = chunk.get("delta")
+                if isinstance(content_part, str) and content_part:
+                    return ModelResponseStream(
+                        choices=[
+                            {
+                                "index": int(chunk.get("summary_index") or 0),
+                                "delta": {"reasoning_content": content_part},
+                                "finish_reason": None,
+                            }
+                        ]
+                    )
+            return original(parsed_chunk)
+
+        setattr(patched_translate, "_opencode_reasoning_text_patched", True)
+        OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream = staticmethod(
+            patched_translate
+        )
+        _RESPONSES_REASONING_TEXT_PATCHED = True
+        log.info("patched LiteLLM Responses bridge to preserve reasoning_text deltas")
+    except Exception as exc:
+        log.warning("failed to patch LiteLLM Responses reasoning_text bridge: %s", exc)
+
+
+_CLIENT_DISCONNECT_METADATA_PATCHED = False
+
+
+def _patch_litellm_client_disconnect_metadata() -> None:
+    global _CLIENT_DISCONNECT_METADATA_PATCHED
+
+    if _CLIENT_DISCONNECT_METADATA_PATCHED:
+        return
+
+    try:
+        from litellm.proxy import common_request_processing as _crp
+
+        original = _crp._apply_client_disconnect_metadata
+        if getattr(original, "_opencode_disconnect_patched", False):
+            _CLIENT_DISCONNECT_METADATA_PATCHED = True
+            return
+
+        def _safe_apply_disconnect(target_metadata: Any) -> None:
+            if not isinstance(target_metadata, dict):
+                return
+            target_metadata["client_disconnected"] = True
+            target_metadata["error_information"] = dict(_crp._CLIENT_DISCONNECTED_ERROR_INFORMATION)
+
+        setattr(_safe_apply_disconnect, "_opencode_disconnect_patched", True)
+        _crp._apply_client_disconnect_metadata = _safe_apply_disconnect
+        _CLIENT_DISCONNECT_METADATA_PATCHED = True
+        log.info("patched LiteLLM _apply_client_disconnect_metadata to handle None metadata")
+    except Exception as exc:
+        log.warning("failed to patch LiteLLM client disconnect metadata: %s", exc)
+
+
+def _encode_like(text: str, original: Any) -> Any:
+    if isinstance(original, (bytes, bytearray)):
+        return text.encode("utf-8")
+    return text
+
+
+def _parse_sse_event(raw_event: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    event_name: Optional[str] = None
+    data_lines: List[str] = []
+    for line in raw_event.splitlines():
+        if line.startswith("event:"):
+            event_name = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+    if not data_lines:
+        return event_name, None
+    data = "\n".join(data_lines)
+    try:
+        return event_name, json.loads(data)
+    except Exception:
+        return event_name, None
+
+
+def _sse(event_name: str, payload: Dict[str, Any], original: Any) -> Any:
+    text = "event: " + event_name + "\n"
+    text += "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    return _encode_like(text, original)
+
+
+def _sse_comment(text: str, original: Any) -> Any:
+    return _encode_like(": " + text + "\n\n", original)
+
+
+async def _cancel_and_close_stream_iterator(
+    iterator: Any,
+    next_chunk: "asyncio.Task[Any]",
+    request_context: str,
+) -> None:
+    """Stop one request's pending stream read without touching its shared session."""
+    cancellation_requested = not next_chunk.done()
+    if cancellation_requested:
+        next_chunk.cancel()
+
+    try:
+        done, _ = await asyncio.wait(
+            {next_chunk},
+            timeout=UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        # Async-generator finalization itself can be cancelled during event-loop
+        # shutdown. The request-scoped outer hook also closes the response.
+        return
+    except BaseException as exc:
+        log.warning(
+            "failed while waiting for upstream stream cancellation context=%s error=%s",
+            request_context,
+            exc,
+        )
+        return
+
+    if next_chunk not in done:
+        # Calling aclose() while __anext__() is still executing can raise
+        # "asynchronous generator is already running". Do not introduce that
+        # race; retain a diagnostic so provider-specific transport abort can be
+        # added if an iterator ever ignores asyncio cancellation.
+        log.error(
+            "upstream stream ignored cancellation after %.1fs context=%s iterator=%s",
+            UPSTREAM_STREAM_CANCEL_TIMEOUT_SECONDS,
+            request_context,
+            type(iterator).__name__,
+        )
+        return
+
+    try:
+        next_chunk.result()
+    except BaseException:
+        pass
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        try:
+            close_result = close()
+            if close_result is not None:
+                await asyncio.wait_for(
+                    close_result,
+                    timeout=UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS,
+                )
+        except BaseException as exc:
+            log.warning(
+                "failed to close request-scoped upstream stream context=%s "
+                "iterator=%s error=%s",
+                request_context,
+                type(iterator).__name__,
+                exc,
+            )
+            return
+
+    if cancellation_requested:
+        log.info(
+            "cancelled and closed request-scoped upstream stream context=%s iterator=%s",
+            request_context,
+            type(iterator).__name__,
+        )
+
+
+async def _close_request_stream(stream: Any, request_context: str) -> None:
+    """Close one LiteLLM request stream, never the shared HTTP client session."""
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        log.warning(
+            "request-scoped upstream stream has no aclose context=%s stream=%s",
+            request_context,
+            type(stream).__name__,
+        )
+        return
+    try:
+        close_result = close()
+        if close_result is not None:
+            await asyncio.wait_for(
+                close_result,
+                timeout=UPSTREAM_STREAM_CLOSE_TIMEOUT_SECONDS,
+            )
+    except asyncio.CancelledError:
+        # Do not let cancellation of one cleanup step prevent the outer hook
+        # from attempting to close the provider response as well.
+        return
+    except BaseException as exc:
+        log.warning(
+            "failed to close request-scoped upstream response context=%s "
+            "stream=%s error=%s",
+            request_context,
+            type(stream).__name__,
+            exc,
+        )
+
+
+async def _iter_with_keepalive(
+    response: Any,
+    request_context: str = "unknown-request",
+    keepalive_seconds: float = MESSAGES_STREAM_KEEPALIVE_SECONDS,
+    force_keepalive_at: Optional[float] = None,
+) -> AsyncGenerator[Any, None]:
+    iterator = response.__aiter__()
+    next_chunk = asyncio.create_task(iterator.__anext__())
+    original_for_output: Any = b""
+    last_chunk_at = time.time()
+    forced_keepalive_sent = False
+
+    try:
+        while True:
+            timeout = keepalive_seconds
+            if force_keepalive_at is not None and not forced_keepalive_sent:
+                timeout = min(timeout, max(0.0, force_keepalive_at - time.time()))
+            done, _ = await asyncio.wait({next_chunk}, timeout=timeout)
+            if not done:
+                idle_seconds = time.time() - last_chunk_at
+                if idle_seconds >= MESSAGES_STREAM_IDLE_TIMEOUT_SECONDS:
+                    log.warning(
+                        "messages stream idle timeout after %.1fs context=%s",
+                        idle_seconds,
+                        request_context,
+                    )
+                    break
+                if force_keepalive_at is not None and time.time() >= force_keepalive_at:
+                    forced_keepalive_sent = True
+                yield _sse_comment("opencode-compat keepalive", original_for_output)
+                continue
+
+            try:
+                chunk = next_chunk.result()
+            except StopAsyncIteration:
+                break
+
+            original_for_output = chunk
+            last_chunk_at = time.time()
+            yield chunk
+            # Start the next provider read only when the consumer asks for the
+            # next output chunk. If the converter returns after a complete tool
+            # call, there is no detached prefetch task left reading upstream.
+            next_chunk = asyncio.create_task(iterator.__anext__())
+    finally:
+        await _cancel_and_close_stream_iterator(
+            iterator,
+            next_chunk,
+            request_context,
+        )
+
+
+def _is_complete_json_object(text: str) -> bool:
+    try:
+        return isinstance(json.loads(text), dict)
+    except Exception:
+        return False
+
+
+def _event_index(payload: Dict[str, Any], default: int = 0) -> int:
+    value = payload.get("index", default)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _first_complete_openai_tool_call(
+    state: Dict[int, Dict[str, str]], delta: Any
+) -> Optional[Dict[str, Any]]:
+    tool_calls = _get(delta, "tool_calls", None)
+    if not tool_calls:
+        return None
+
+    for tool_call in tool_calls:
+        index = _get(tool_call, "index", 0) or 0
+        entry = state.setdefault(int(index), {"id": "", "name": "", "arguments": ""})
+        tool_id = _get(tool_call, "id", None)
+        if tool_id:
+            entry["id"] = str(tool_id)
+
+        function = _get(tool_call, "function", {}) or {}
+        name = _get(function, "name", None)
+        if name:
+            entry["name"] = str(name)
+        arguments = _get(function, "arguments", None)
+        if isinstance(arguments, str):
+            entry["arguments"] += arguments
+
+        log.info("openai_tool_delta index=%s id=%s name=%r args_preview=%s",
+                 index, _get(tool_call, "id", None),
+                 name, str(arguments or "")[:200])
+
+        if entry["name"] and _is_complete_json_object(entry["arguments"]):
+            log.info("openai_tool_completed name=%r args=%s", entry["name"], entry["arguments"][:200])
+            return {
+                "id": entry["id"] or "call_" + uuid.uuid4().hex,
+                "type": "function",
+                "function": {
+                    "name": entry["name"],
+                    "arguments": entry["arguments"],
+                },
+            }
+
+    return None
+
+
+def _messages_text_delta(text: str, index: int, original: Any, delta_type: str = "text_delta") -> Any:
+    field = "thinking" if delta_type == "thinking_delta" else "text"
+    return _sse(
+        "content_block_delta",
+        {"type": "content_block_delta", "index": index, "delta": {"type": delta_type, field: text}},
+        original,
+    )
+
+
+def _raw_think_state() -> Dict[str, Any]:
+    return {
+        "in_think": False,
+        "tail": "",
+        "started_at": None,
+        "suppressed_chars": 0,
+        "suppressed_chunks": 0,
+        "forwarded_thinking_chars": 0,
+        "preview": "",
+        "visible_chars": 0,
+        "warned_unclosed": False,
+        "placeholder_emitted": False,
+        "revealing": False,
+        "reveal_prefix_emitted": False,
+    }
+
+
+def _record_raw_think_suppressed(text: str, state: Dict[str, Any]) -> None:
+    if not text:
+        return
+
+    if state.get("started_at") is None:
+        state["started_at"] = time.time()
+    state["suppressed_chars"] = int(state.get("suppressed_chars") or 0) + len(text)
+    state["suppressed_chunks"] = int(state.get("suppressed_chunks") or 0) + 1
+
+    preview = str(state.get("preview") or "")
+    if len(preview) < RAW_THINK_PREVIEW_LIMIT:
+        remaining = RAW_THINK_PREVIEW_LIMIT - len(preview)
+        state["preview"] = preview + text[:remaining]
+
+
+def _should_reveal_hidden_thinking(state: Dict[str, Any]) -> bool:
+    if state.get("revealing"):
+        return True
+    started_at = state.get("started_at")
+    if not isinstance(started_at, (int, float)):
+        return False
+    if time.time() - started_at < REVEAL_HIDDEN_THINKING_AFTER_SECONDS:
+        return False
+    state["revealing"] = True
+    log.warning(
+        "revealing hidden thinking after %.1fs chars=%s chunks=%s preview=%r",
+        time.time() - started_at,
+        state.get("suppressed_chars") or 0,
+        state.get("suppressed_chunks") or 0,
+        str(state.get("preview") or "").replace("\n", "\\n"),
+    )
+    return True
+
+
+def _hidden_thinking_reveal_prefix(state: Dict[str, Any]) -> str:
+    if state.get("reveal_prefix_emitted"):
+        return ""
+    state["reveal_prefix_emitted"] = True
+    preview = str(state.get("preview") or "")
+    if not preview:
+        return ""
+    omitted = int(state.get("suppressed_chars") or 0) - len(preview)
+    if omitted > 0:
+        return preview + "\n...\n"
+    return preview
+
+
+def _raw_think_preview_has_tool_prefix(state: Dict[str, Any]) -> bool:
+    preview = str(state.get("preview") or "")
+    if not preview:
+        return False
+    lowered = preview.lower()
+    return (
+        "<tool_call" in lowered
+        or "<｜dsml｜tool_calls" in lowered
+        or "<|dsml|tool_calls" in lowered
+        or has_any_dsml_prefix(preview)
+    )
+
+
+def _hidden_thinking_final_fallback(
+    state: Dict[str, Any], pending: Iterable[str], unflushed_text: str
+) -> str:
+    if state.get("in_think") and _raw_think_preview_has_tool_prefix(state):
+        return ""
+    if _raw_think_has_visible_output(state, pending, unflushed_text):
+        return ""
+    if int(state.get("suppressed_chars") or 0) <= 0:
+        return ""
+    state["revealing"] = True
+    fallback = _hidden_thinking_reveal_prefix(state)
+    state["visible_chars"] = int(state.get("visible_chars") or 0) + len(fallback)
+    return fallback
+
+
+def _request_context(request_data: Optional[dict]) -> str:
+    names = sorted(_request_model_names(request_data))
+    metadata = (request_data or {}).get("litellm_metadata") or {}
+    pieces = []
+    if names:
+        pieces.append("models=" + ",".join(names))
+    for key in ("request_id", "litellm_call_id", "model_group", "deployment"):
+        value = metadata.get(key)
+        if value:
+            pieces.append(f"{key}={value}")
+    return " ".join(pieces) or "unknown-request"
+
+
+def _stop_hook_session_key(request_data: Optional[dict], request_context: str) -> str:
+    if not request_data:
+        return request_context
+    metadata = request_data.get("litellm_metadata") or {}
+    headers = metadata.get("headers") or {}
+    if isinstance(headers, dict):
+        for key in ("x-claude-code-session-id", "session-id", "x-client-request-id"):
+            value = headers.get(key)
+            if value:
+                return str(value)
+    for key in ("session_id", "trace_id"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    for text in _iter_nested_strings(request_data.get("metadata") or {}):
+        if "session_id" not in text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("session_id"):
+            return str(parsed["session_id"])
+    return request_context
+
+
+def _stop_hook_request_key(session_key: str) -> str:
+    return session_key
+
+
+def _iter_nested_strings(
+    value: Any,
+    _ancestors: Optional[set[int]] = None,
+    _depth: int = 0,
+) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+        return
+    if _depth >= NESTED_REQUEST_SCAN_MAX_DEPTH or not isinstance(value, (dict, list)):
+        return
+
+    ancestors = _ancestors if _ancestors is not None else set()
+    object_id = id(value)
+    if object_id in ancestors:
+        return
+    ancestors.add(object_id)
+    try:
+        items = value.values() if isinstance(value, dict) else value
+        for item in items:
+            yield from _iter_nested_strings(item, ancestors, _depth + 1)
+    finally:
+        ancestors.discard(object_id)
+
+
+def _has_stop_hook_marker(value: Any) -> bool:
+    for text in _iter_nested_strings(value):
+        if "hook_event_name" in text and "Stop" in text:
+            return True
+    return False
+
+
+def _has_stop_hook_json_schema(
+    value: Any,
+    _ancestors: Optional[set[int]] = None,
+    _depth: int = 0,
+) -> bool:
+    if _depth >= NESTED_REQUEST_SCAN_MAX_DEPTH:
+        return False
+
+    ancestors = _ancestors if _ancestors is not None else set()
+    if isinstance(value, (dict, list)):
+        object_id = id(value)
+        if object_id in ancestors:
+            return False
+        ancestors.add(object_id)
+    else:
+        return False
+
+    try:
+        if isinstance(value, dict):
+            required = value.get("required")
+            if isinstance(required, list):
+                required_names = {item for item in required if isinstance(item, str)}
+                if {"ok", "reason", "impossible"}.issubset(required_names):
+                    return True
+            return any(
+                _has_stop_hook_json_schema(item, ancestors, _depth + 1)
+                for item in value.values()
+            )
+        return any(
+            _has_stop_hook_json_schema(item, ancestors, _depth + 1)
+            for item in value
+        )
+    finally:
+        ancestors.discard(object_id)
+
+
+def _has_stop_hook_condition_prompt(value: Any) -> bool:
+    for text in _iter_nested_strings(value):
+        if (
+            "stopping condition" in text
+            and "hook_event_name" in text
+            and "Stop" in text
+            and "ARGUMENTS" in text
+        ):
+            return True
+    return False
+
+
+def _is_stop_hook_json_evaluator(request_data: Optional[dict]) -> bool:
+    if not _is_messages_stream(request_data):
+        return False
+    if not request_data:
+        return False
+    return _has_stop_hook_marker(request_data) and (
+        _has_stop_hook_json_schema(request_data) or _has_stop_hook_condition_prompt(request_data)
+    )
+
+
+def _stop_hook_condition_prompt_message_index(messages: Any) -> int:
+    if not isinstance(messages, list):
+        return -1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        text = _message_content_text(message.get("content") or "")
+        if "hook_event_name" in text and "stopping condition" in text and "ARGUMENTS" in text:
+            return index
+    return -1
+
+
+def _truncate_stop_hook_history(data: dict) -> int:
+    """Keep head + tail of the Stop hook evaluator conversation under a token budget.
+
+    The full multi-hundred-K token session history is not needed to decide
+    whether the current turn is terminal; only the injected condition prompt,
+    the system context, and the most recent exchanges matter. Keeping the head
+    preserves the shared prefix for the radix KV cache while trimming the bulk
+    of the middle, so the prefill stays well under Claude Code's 30s Stop hook
+    timeout. Truncation is bounded by an estimated token budget rather than a
+    raw message count, because a handful of tool results can hold tens of
+    thousands of tokens (source dumps, build logs). Returns the number of
+    messages dropped.
+    """
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    if not messages:
+        return 0
+    condition_index = _stop_hook_condition_prompt_message_index(messages)
+
+    def message_tokens(index: int) -> int:
+        return _estimate_count_tokens(messages[index])
+
+    total_tokens = sum(message_tokens(index) for index in range(len(messages)))
+    if total_tokens <= STOP_HOOK_HISTORY_HEAD_MAX_TOKENS + STOP_HOOK_HISTORY_TAIL_MAX_TOKENS:
+        return 0
+
+    # Build the head: system prompt plus as many early messages as fit.
+    head = 1
+    head_tokens = message_tokens(0)
+    while (
+        head < len(messages)
+        and head_tokens + message_tokens(head) <= STOP_HOOK_HISTORY_HEAD_MAX_TOKENS
+    ):
+        head_tokens += message_tokens(head)
+        head += 1
+
+    # Build the tail: recent messages working backwards until the budget fills.
+    tail = 0
+    tail_tokens = 0
+    while tail < len(messages) - head:
+        candidate = len(messages) - 1 - tail
+        if tail_tokens + message_tokens(candidate) > STOP_HOOK_HISTORY_TAIL_MAX_TOKENS:
+            break
+        tail_tokens += message_tokens(candidate)
+        tail += 1
+    if tail == 0:
+        tail = 1
+        tail_tokens = message_tokens(len(messages) - 1)
+
+    tail_start = len(messages) - tail
+    if head > tail_start:
+        return 0
+
+    # The injected condition prompt must survive; it usually lives in the tail,
+    # but when it sits in the dropped middle, pull it into the head.
+    if 0 <= condition_index < tail_start:
+        if condition_index >= head:
+            head = condition_index + 1
+        if head > tail_start:
+            head = tail_start
+
+    dropped = len(messages) - head - tail
+    if dropped <= 0:
+        return 0
+    data["messages"] = messages[:head] + messages[tail_start:]
+    return dropped
+
+
+def _stop_hook_json_fallback_text() -> str:
+    return json.dumps(
+        {
+            "ok": False,
+            "reason": (
+                "No usable Stop hook JSON was produced by the upstream model; "
+                "continue because the stopping condition is not proven satisfied."
+            ),
+            "impossible": False,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _canonical_stop_hook_json(value: Any) -> Optional[str]:
+    parsed = value
+    if not isinstance(parsed, dict):
+        return None
+    if not isinstance(parsed.get("ok"), bool):
+        return None
+    if not isinstance(parsed.get("reason"), str):
+        return None
+    impossible = parsed.get("impossible")
+    if impossible is not None and not isinstance(impossible, bool):
+        return None
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+
+def _extract_valid_stop_hook_json_text(text: str) -> Optional[str]:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        parsed = None
+    canonical = _canonical_stop_hook_json(parsed)
+    if canonical is not None:
+        return canonical
+
+    # Local models sometimes wrap a schema-compliant object in prose, a JSON
+    # fence, or <goal-complete>. Accept only a complete parsed object with the
+    # exact typed decision fields; a bare mention of "ok" is never sufficient.
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text[index:])
+        except Exception:
+            continue
+        canonical = _canonical_stop_hook_json(candidate)
+        if canonical is not None:
+            return canonical
+
+    # When one provider delta contains the final reasoning token and the first
+    # visible token, LiteLLM's Anthropic conversion can discard that visible
+    # prefix. We have observed all of these suffixes:
+    #   ok":true,...}       (lost {\")
+    #   "ok":true,...}     (lost {)
+    #   true,"reason":...} (lost {"ok":)
+    # Repair only an unambiguous object prefix. The result must still parse as
+    # a complete object and pass the typed Stop-hook schema below; merely
+    # mentioning "ok" or "true" in prose is never accepted.
+    visible_tail = text.rsplit("</think>", 1)[-1].strip()
+    repaired_candidates: List[str] = []
+    if re.match(r'^ok"\s*:', visible_tail):
+        repaired_candidates.append('{"' + visible_tail)
+    if re.match(r'^"ok"\s*:', visible_tail):
+        repaired_candidates.append("{" + visible_tail)
+    if re.match(r'^(?:true|false)\s*,\s*"reason"\s*:', visible_tail):
+        repaired_candidates.append('{"ok":' + visible_tail)
+    for repaired in repaired_candidates:
+        try:
+            candidate = json.loads(repaired)
+        except Exception:
+            continue
+        canonical = _canonical_stop_hook_json(candidate)
+        if canonical is not None:
+            return canonical
+    return None
+
+
+def _is_valid_stop_hook_json_text(text: str) -> bool:
+    return _extract_valid_stop_hook_json_text(text) is not None
+
+
+def _stop_hook_json_fallback_due(
+    started_at: float,
+    last_progress_at: float,
+    now: Optional[float] = None,
+) -> bool:
+    current = time.time() if now is None else now
+    elapsed = current - started_at
+    if elapsed < STOP_HOOK_JSON_FALLBACK_SECONDS:
+        return False
+    if elapsed >= STOP_HOOK_JSON_ACTIVE_MAX_SECONDS:
+        return True
+    return current - last_progress_at >= STOP_HOOK_JSON_PROGRESS_GRACE_SECONDS
+
+
+def _mutate_stop_hook_fallback_counts(mutator: Any) -> Any:
+    try:
+        with open(_STOP_HOOK_JSON_FALLBACK_COUNTS_PATH, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            raw = handle.read().strip()
+            counts = json.loads(raw) if raw else {}
+            if not isinstance(counts, dict):
+                counts = {}
+            result = mutator(counts)
+            handle.seek(0)
+            handle.truncate()
+            json.dump(counts, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return result
+    except Exception as exc:
+        log.warning("Stop hook fallback counter file unavailable, using process memory: %s", exc)
+        return mutator(_STOP_HOOK_JSON_FALLBACK_COUNTS)
+
+
+def _stop_hook_fallback_entry(value: Any) -> Tuple[int, Optional[float]]:
+    if isinstance(value, dict):
+        try:
+            count = int(value.get("count") or 0)
+        except Exception:
+            count = 0
+        updated_at = value.get("updated_at")
+        if isinstance(updated_at, (int, float)):
+            return count, float(updated_at)
+        return count, None
+    try:
+        return int(value or 0), None
+    except Exception:
+        return 0, None
+
+
+def _stop_hook_fallback_entry_expired(updated_at: Optional[float], now: float) -> bool:
+    return updated_at is not None and now - updated_at > STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS
+
+
+def _set_stop_hook_fallback_entry(counts: Dict[str, Any], session_key: str, count: int, now: float) -> None:
+    counts[session_key] = {"count": count, "updated_at": now}
+
+
+def _stop_hook_json_fallback_available(session_key: str, request_context: str) -> bool:
+    now = time.time()
+
+    def mutate(counts: Dict[str, Any]) -> Tuple[bool, int, bool]:
+        count, updated_at = _stop_hook_fallback_entry(counts.get(session_key))
+        if _stop_hook_fallback_entry_expired(updated_at, now):
+            counts.pop(session_key, None)
+            return True, 0, True
+        if count < STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE:
+            return True, count, False
+        counts.pop(session_key, None)
+        return False, count, False
+
+    available, count, idle_reset = _mutate_stop_hook_fallback_counts(mutate)
+    if idle_reset:
+        log.info(
+            "Stop hook JSON fallback counter reset after %.0fs idle session=%s context=%s",
+            STOP_HOOK_JSON_FALLBACK_IDLE_RESET_SECONDS,
+            session_key,
+            request_context,
+        )
+    if available:
+        return True
+    log.warning(
+        "Stop hook JSON fallback suppressed after %d consecutive fallbacks and counter reset session=%s context=%s",
+        count,
+        session_key,
+        request_context,
+    )
+    return False
+
+
+def _record_stop_hook_json_fallback(session_key: str, request_context: str, reason: str) -> None:
+    now = time.time()
+
+    def mutate(counts: Dict[str, Any]) -> int:
+        count, updated_at = _stop_hook_fallback_entry(counts.get(session_key))
+        if _stop_hook_fallback_entry_expired(updated_at, now):
+            count = 0
+        count += 1
+        _set_stop_hook_fallback_entry(counts, session_key, count, now)
+        return count
+
+    count = _mutate_stop_hook_fallback_counts(mutate)
+    log.warning(
+        "Stop hook JSON fallback count=%d/%d reason=%s session=%s context=%s",
+        count,
+        STOP_HOOK_JSON_FALLBACK_MAX_CONSECUTIVE,
+        reason,
+        session_key,
+        request_context,
+    )
+
+
+def _record_stop_hook_valid_json(session_key: str, request_context: str) -> None:
+    def mutate(counts: Dict[str, Any]) -> int:
+        previous, _ = _stop_hook_fallback_entry(counts.pop(session_key, 0))
+        return previous
+
+    previous = _mutate_stop_hook_fallback_counts(mutate)
+    if previous:
+        log.info(
+            "Stop hook JSON fallback counter reset after valid JSON previous=%d session=%s context=%s",
+            previous,
+            session_key,
+            request_context,
+        )
+
+
+def _incomplete_raw_tool_fallback_text() -> str:
+    return (
+        "model output malformed: upstream ended inside an incomplete raw tool call; "
+        "no usable response or tool call was produced. Retry this step."
+    )
+
+
+def _warn_unclosed_raw_think(state: Dict[str, Any], context: str) -> None:
+    if not state.get("in_think") or state.get("warned_unclosed"):
+        return
+
+    started_at = state.get("started_at")
+    duration = time.time() - started_at if isinstance(started_at, (int, float)) else 0.0
+    preview = str(state.get("preview") or "").replace("\n", "\\n")
+    log.warning(
+        "unclosed raw <think> suppressed context=%s chars=%s chunks=%s duration=%.1fs preview=%r",
+        context,
+        state.get("suppressed_chars") or 0,
+        state.get("suppressed_chunks") or 0,
+        duration,
+        preview,
+    )
+    state["warned_unclosed"] = True
+
+
+def _raw_think_placeholder(state: Dict[str, Any], context: str) -> str:
+    if not state.get("in_think"):
+        return ""
+    _warn_unclosed_raw_think(state, context)
+    if state.get("placeholder_emitted") or int(state.get("visible_chars") or 0) > 0:
+        return ""
+    state["placeholder_emitted"] = True
+    return ASSISTANT_PLACEHOLDER
+
+
+def _raw_think_has_visible_output(
+    state: Dict[str, Any], pending: Iterable[str], unflushed_text: str
+) -> bool:
+    return (
+        int(state.get("visible_chars") or 0) > 0
+        or any(bool(item) for item in pending)
+        or bool(unflushed_text)
+    )
+
+
+def _empty_unclosed_raw_think_placeholder(
+    state: Dict[str, Any],
+    context: str,
+    pending: Iterable[str],
+    unflushed_text: str,
+    has_native_tool: bool,
+) -> str:
+    if not state.get("in_think") or has_native_tool:
+        return ""
+
+    if _raw_think_has_visible_output(state, pending, unflushed_text):
+        return ""
+
+    return _raw_think_placeholder(state, context)
+
+
+def _matching_prefix_suffix(text: str, marker: str) -> str:
+    max_len = min(len(text), len(marker) - 1)
+    for size in range(max_len, 0, -1):
+        if marker.startswith(text[-size:]):
+            return text[-size:]
+    return ""
+
+
+def _matching_raw_tool_prefix_suffix(text: str) -> str:
+    matches = [_matching_prefix_suffix(text, marker) for marker in RAW_TOOL_OPEN_MARKERS]
+    return max(matches, key=len, default="")
+
+
+def _first_raw_tool_open_index(text: str) -> int:
+    indexes = [idx for marker in RAW_TOOL_OPEN_MARKERS if (idx := text.find(marker)) != -1]
+    return min(indexes) if indexes else -1
+
+
+def _strip_raw_think_delta(text: str, state: Dict[str, Any]) -> str:
+    """Drop raw <think>...</think> text from model deltas, including split markers."""
+    if not text:
+        return ""
+
+    open_marker = "<think>"
+    close_marker = "</think>"
+    data = str(state.get("tail") or "") + text
+    state["tail"] = ""
+    output: List[str] = []
+
+    while data:
+        if state.get("in_think"):
+            close_idx = data.find(close_marker)
+            tool_idx = _first_raw_tool_open_index(data)
+            if tool_idx != -1 and (close_idx == -1 or tool_idx < close_idx):
+                hidden_segment = data[:tool_idx]
+                if _should_reveal_hidden_thinking(state):
+                    state["_revealed_delta"] = True
+                    output.append(_hidden_thinking_reveal_prefix(state))
+                    output.append(hidden_segment)
+                else:
+                    _record_raw_think_suppressed(hidden_segment, state)
+                state["in_think"] = False
+                state["implicit_tool_boundary"] = True
+                output.append(data[tool_idx:])
+                visible = "".join(output)
+                state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
+                return visible
+
+            if close_idx == -1:
+                close_tail = _matching_prefix_suffix(data, close_marker)
+                tool_tail = _matching_raw_tool_prefix_suffix(data)
+                tail = max((close_tail, tool_tail), key=len)
+                hidden_segment = data[:-len(tail)] if tail else data
+                if _should_reveal_hidden_thinking(state):
+                    state["_revealed_delta"] = True
+                    output.append(_hidden_thinking_reveal_prefix(state))
+                    output.append(hidden_segment)
+                else:
+                    _record_raw_think_suppressed(hidden_segment, state)
+                if tail:
+                    state["tail"] = tail
+                visible = "".join(output)
+                state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
+                return visible
+            hidden_segment = data[:close_idx]
+            if _should_reveal_hidden_thinking(state):
+                state["_revealed_delta"] = True
+                output.append(_hidden_thinking_reveal_prefix(state))
+                output.append(hidden_segment)
+            else:
+                _record_raw_think_suppressed(hidden_segment, state)
+            data = data[close_idx + len(close_marker):]
+            state["in_think"] = False
+            continue
+
+        open_idx = data.find(open_marker)
+        if open_idx == -1:
+            tail = _matching_prefix_suffix(data, open_marker)
+            if tail:
+                output.append(data[:-len(tail)])
+                state["tail"] = tail
+            else:
+                output.append(data)
+            visible = "".join(output)
+            state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
+            return visible
+
+        output.append(data[:open_idx])
+        data = data[open_idx + len(open_marker):]
+        state["in_think"] = True
+        state["started_at"] = time.time()
+
+    visible = "".join(output)
+    state["visible_chars"] = int(state.get("visible_chars") or 0) + len(visible)
+    return visible
+
+
+def _flush_raw_think_tail(state: Dict[str, Any]) -> str:
+    tail = str(state.get("tail") or "")
+    state["tail"] = ""
+    return "" if state.get("in_think") else tail
+
+
+def _yield_unclosed_think_completion(
+    raw_think: Dict[str, Any],
+    pending: List[str],
+    unflushed_text: str,
+    text_block_index: int,
+    text_delta_type: str,
+    original: Any,
+    request_context: str,
+    has_native_tool: bool,
+    open_content_blocks: Iterable[int],
+) -> Tuple[List[Any], List[str], str]:
+    events: List[Any] = []
+    open_blocks = set(open_content_blocks)
+    tail = _flush_raw_think_tail(raw_think)
+    if tail:
+        unflushed_text += tail
+    fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+    if fallback:
+        events.append(_messages_text_delta(fallback, text_block_index, original, "text_delta"))
+        raw_think["warned_unclosed"] = True
+    placeholder = _empty_unclosed_raw_think_placeholder(
+        raw_think, request_context, pending, unflushed_text, has_native_tool
+    )
+    if placeholder:
+        if text_block_index in open_blocks:
+            events.append(_messages_text_delta(placeholder, text_block_index, original, text_delta_type))
+        else:
+            placeholder_index = text_block_index + 1
+            events.append(
+                _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": placeholder_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                    original,
+                )
+            )
+            events.append(_messages_text_delta(placeholder, placeholder_index, original, "text_delta"))
+            events.append(
+                _sse("content_block_stop", {"type": "content_block_stop", "index": placeholder_index}, original)
+            )
+    for item in pending:
+        events.append(_messages_text_delta(item, text_block_index, original, text_delta_type))
+    pending = []
+    if unflushed_text:
+        events.append(_messages_text_delta(unflushed_text, text_block_index, original, text_delta_type))
+        unflushed_text = ""
+    if raw_think.get("in_think") and not raw_think.get("warned_unclosed"):
+        _warn_unclosed_raw_think(raw_think, request_context)
+    return events, pending, unflushed_text
+
+
+def _messages_tool_use_events(tool_calls: Iterable[Dict[str, Any]], start_index: int, original: Any) -> List[Any]:
+    events: List[Any] = []
+    index = start_index
+    for tc in tool_calls:
+        fn = tc["function"]
+        tool_id = "toolu_" + uuid.uuid4().hex[:24]
+        args = fn.get("arguments") or "{}"
+        log.info("emitting_tool_use name=%r tool_id=%s args_preview=%s", fn["name"], tool_id, str(args)[:200])
+        events.append(
+            _sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "tool_use", "id": tool_id, "name": fn["name"], "input": {}},
+                },
+                original,
+            )
+        )
+        events.append(
+            _sse(
+                "content_block_delta",
+                {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": args}},
+                original,
+            )
+        )
+        events.append(_sse("content_block_stop", {"type": "content_block_stop", "index": index}, original))
+        index += 1
+
+    events.append(
+        _sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            },
+            original,
+        )
+    )
+    events.append(_sse("message_stop", {"type": "message_stop"}, original))
+    return events
+
+
+def _request_tool_schemas(request_data: Optional[dict]) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(request_data, dict):
+        return {}
+
+    tools = request_data.get("tools")
+    if not isinstance(tools, list):
+        optional_params = request_data.get("optional_params")
+        tools = optional_params.get("tools") if isinstance(optional_params, dict) else None
+    if not isinstance(tools, list):
+        return {}
+
+    schemas: Dict[str, Dict[str, Any]] = {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            schema = function.get("parameters")
+        else:
+            name = tool.get("name")
+            schema = tool.get("input_schema")
+        if isinstance(name, str) and name:
+            schemas[name] = schema if isinstance(schema, dict) else {"type": "object"}
+    return schemas
+
+
+_INTEGER_STRING_PATTERN = re.compile(r"^[+-]?\d+$")
+_NUMBER_STRING_PATTERN = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _coerce_string_for_schema_type(value: str, schema_type: str) -> Any:
+    """Best-effort coercion of a string argument to the declared scalar type."""
+    text = value.strip()
+    if schema_type == "integer":
+        if _INTEGER_STRING_PATTERN.match(text):
+            try:
+                return int(text)
+            except ValueError:
+                return value
+        return value
+    if schema_type == "number":
+        if _NUMBER_STRING_PATTERN.match(text):
+            try:
+                number = float(text)
+            except ValueError:
+                return value
+            return int(text) if _INTEGER_STRING_PATTERN.match(text) else number
+        return value
+    if schema_type == "boolean":
+        lowered = text.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        return value
+    return value
+
+
+def _coerce_value_for_schema(value: Any, schema: Any) -> Any:
+    """Coerce raw tool argument values to the types declared by the tool schema.
+
+    Local models frequently emit every raw (DSML/Qwen XML) parameter as a
+    string, so an integer-typed parameter arrives as "120" and is then
+    rejected by schema validation. Only strings are coerced, and only when
+    they unambiguously match the declared scalar type.
+    """
+    if not isinstance(schema, dict):
+        return value
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        for option in schema_type:
+            coerced = _coerce_value_for_schema(value, {**schema, "type": option})
+            if coerced != value or type(coerced) is not type(value):
+                return coerced
+        return value
+
+    if isinstance(value, str) and isinstance(schema_type, str):
+        coerced = _coerce_string_for_schema_type(value, schema_type)
+        if coerced != value or type(coerced) is not type(value):
+            return coerced
+        return value
+
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return {
+                key: _coerce_value_for_schema(item, properties.get(key))
+                for key, item in value.items()
+            }
+        return value
+
+    if isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            return [_coerce_value_for_schema(item, items) for item in value]
+        return value
+
+    for combiner in ("anyOf", "oneOf"):
+        branches = schema.get(combiner)
+        if isinstance(branches, list):
+            for branch in branches:
+                coerced = _coerce_value_for_schema(value, branch)
+                if coerced != value or type(coerced) is not type(value):
+                    return coerced
+    return value
+
+
+def _coerce_tool_arguments_for_schemas(
+    tool_calls: Iterable[Dict[str, Any]], tool_schemas: Dict[str, Dict[str, Any]]
+) -> None:
+    """Rewrite parsed raw tool call arguments in place to match declared types."""
+    if not tool_schemas:
+        return
+    for tool_call in tool_calls:
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        schema = tool_schemas.get(name) if isinstance(name, str) else None
+        if not isinstance(schema, dict):
+            continue
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            continue
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        coerced = _coerce_value_for_schema(parsed, schema)
+        if coerced != parsed:
+            log.info("coerced tool %r argument types to match request schema", name)
+            function["arguments"] = json.dumps(coerced, ensure_ascii=False)
+
+
+def _validate_implicit_tool_calls(
+    tool_calls: Iterable[Dict[str, Any]], tool_schemas: Dict[str, Dict[str, Any]]
+) -> Tuple[bool, str]:
+    if not tool_schemas:
+        return False, "the request did not provide any callable tools"
+
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError:
+        Draft202012Validator = None  # type: ignore[assignment,misc]
+
+    for tool_call in tool_calls:
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            return False, "the recovered tool call has no function object"
+        name = function.get("name")
+        if not isinstance(name, str) or name not in tool_schemas:
+            return False, f"tool {name!r} was not offered in this request"
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            return False, f"tool {name!r} arguments are not JSON text"
+        try:
+            parsed_arguments = json.loads(arguments)
+        except (TypeError, ValueError) as exc:
+            return False, f"tool {name!r} arguments are invalid JSON: {exc}"
+        if not isinstance(parsed_arguments, dict):
+            return False, f"tool {name!r} arguments must decode to an object"
+        if Draft202012Validator is not None:
+            errors = sorted(
+                Draft202012Validator(tool_schemas[name]).iter_errors(parsed_arguments),
+                key=lambda error: list(error.path),
+            )
+            if errors:
+                return False, f"tool {name!r} arguments fail schema validation: {errors[0].message}"
+    return True, ""
+
+
+def _messages_end_turn_events(index: int, original: Any) -> List[Any]:
+    return [
+        _sse("content_block_stop", {"type": "content_block_stop", "index": index}, original),
+        _sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 0},
+            },
+            original,
+        ),
+        _sse("message_stop", {"type": "message_stop"}, original),
+    ]
+
+
+def _messages_text_end_turn_events(text: str, index: int, original: Any, start_block: bool = False) -> List[Any]:
+    events: List[Any] = []
+    if start_block:
+        events.append(
+            _sse(
+                "content_block_start",
+                {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}},
+                original,
+            )
+        )
+    events.append(_messages_text_delta(text, index, original, "text_delta"))
+    events.extend(_messages_end_turn_events(index, original))
+    return events
+
+
+def _estimate_count_tokens(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        cjk_chars = sum(
+            1
+            for char in value
+            if "\u3400" <= char <= "\u9fff"
+            or "\uf900" <= char <= "\ufaff"
+            or "\u3040" <= char <= "\u30ff"
+            or "\uac00" <= char <= "\ud7af"
+        )
+        other_chars = len(value) - cjk_chars
+        return cjk_chars + (other_chars + 3) // 4
+    if isinstance(value, (int, float, bool)):
+        return 1
+    if isinstance(value, dict):
+        return 4 + sum(_estimate_count_tokens(k) + _estimate_count_tokens(v) for k, v in value.items())
+    if isinstance(value, list):
+        return 2 + sum(_estimate_count_tokens(item) for item in value)
+    return (len(str(value)) + 2) // 3
+
+
+def _estimate_anthropic_messages_tokens(payload: Dict[str, Any]) -> int:
+    total = 0
+    total += _estimate_count_tokens(payload.get("system"))
+    total += _estimate_count_tokens(payload.get("messages"))
+    total += _estimate_count_tokens(payload.get("tools"))
+    total += _estimate_count_tokens(payload.get("tool_choice"))
+    # Account for role/content framing and request metadata that local tokenizers
+    # do not see but model chat templates do.
+    message_count = len(payload.get("messages") or []) if isinstance(payload.get("messages"), list) else 0
+    tool_count = len(payload.get("tools") or []) if isinstance(payload.get("tools"), list) else 0
+    total += 128 + message_count * 12 + tool_count * 24
+    return max(1, int(total * 1.10))
+
+
+def _extract_input_tokens(value: Any) -> Optional[int]:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    if hasattr(value, "body"):
+        try:
+            value = json.loads(value.body)
+        except Exception:
+            return None
+    if isinstance(value, dict):
+        tokens = value.get("input_tokens", value.get("total_tokens"))
+        try:
+            return int(tokens)
+        except Exception:
+            return None
+    return None
+
+
+def _message_start_with_estimated_usage(payload: Dict[str, Any], request_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return payload
+    usage = message.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    try:
+        if int(usage.get("input_tokens") or 0) > 0:
+            return payload
+    except Exception:
+        pass
+
+    estimated_tokens = _estimate_anthropic_messages_tokens(request_data or {})
+    patched_payload = dict(payload)
+    patched_message = dict(message)
+    patched_usage = dict(usage)
+    patched_usage["input_tokens"] = estimated_tokens
+    patched_usage.setdefault("output_tokens", 0)
+    patched_usage.setdefault("cache_creation_input_tokens", 0)
+    patched_usage.setdefault("cache_read_input_tokens", 0)
+    patched_message["usage"] = patched_usage
+    patched_payload["message"] = patched_message
+    return patched_payload
+
+
+class OpencodeCompatHandler(CustomLogger):
+    """Compatibility layer for opencode raw DSML/Qwen tool-call output."""
+
+    def __init__(self) -> None:
+        self._stop_hook_capability_cache: Dict[str, Tuple[float, bool, Tuple[str, ...]]] = {}
+        _patch_litellm_responses_empty_tools_bridge()
+        _patch_litellm_responses_reasoning_text_bridge()
+        _patch_litellm_client_disconnect_metadata()
+        self._register_input_tokens_route()
+        self._register_messages_count_tokens_route()
+
+    def _register_input_tokens_route(self) -> None:
+        try:
+            from fastapi import Request
+            from fastapi.responses import JSONResponse
+            from litellm.proxy.proxy_server import app
+
+            route_path = "/v1/responses/input_tokens"
+            for route in getattr(app, "routes", []):
+                if getattr(route, "path", None) == route_path:
+                    return
+
+            @app.post(route_path)
+            async def opencode_responses_input_tokens(request: Request):
+                body = await request.body()
+                try:
+                    payload = json.loads(body)
+                    total_chars = 0
+                    for item in payload.get("input", []) or []:
+                        content = item.get("content", "") if isinstance(item, dict) else ""
+                        if isinstance(content, str):
+                            total_chars += len(content)
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    total_chars += len(part.get("text", ""))
+                    tokens = max(1, total_chars // 4)
+                except Exception:
+                    tokens = 100
+                return JSONResponse(content={"object": "response.input_tokens", "input_tokens": tokens})
+
+            log.info("registered opencode compatibility route %s", route_path)
+        except Exception as exc:
+            log.warning("failed to register /v1/responses/input_tokens route: %s", exc)
+
+    def _register_messages_count_tokens_route(self) -> None:
+        try:
+            from fastapi import Depends, Request
+            from fastapi.responses import JSONResponse
+            from fastapi.routing import APIRoute
+            from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+            from litellm.proxy.proxy_server import app
+
+            route_paths = ("/v1/messages/count_tokens", "/messages/count_tokens")
+            route_name = "opencode_messages_count_tokens"
+            original_endpoints: Dict[str, Any] = {}
+            for route in getattr(app, "routes", []):
+                if getattr(route, "name", None) == route_name:
+                    return
+                path = getattr(route, "path", None)
+                endpoint = getattr(route, "endpoint", None)
+                if path in route_paths and endpoint is not None:
+                    original_endpoints[str(path)] = endpoint
+
+            def get_original_endpoint(request: Request) -> Any:
+                original = original_endpoints.get(request.url.path)
+                if original is not None:
+                    return original
+                for route in getattr(request.app, "routes", []):
+                    if getattr(route, "name", None) == route_name:
+                        continue
+                    if getattr(route, "path", None) != request.url.path:
+                        continue
+                    endpoint = getattr(route, "endpoint", None)
+                    if endpoint is not None:
+                        original_endpoints[request.url.path] = endpoint
+                        return endpoint
+                return None
+
+            async def opencode_messages_count_tokens(request: Request):
+                try:
+                    body = await request.body()
+                    payload = json.loads(body) if body else {}
+                    payload = payload if isinstance(payload, dict) else {}
+                except Exception:
+                    payload = {}
+                estimated_tokens = _estimate_anthropic_messages_tokens(payload)
+                if estimated_tokens >= COUNT_TOKENS_NATIVE_MAX_ESTIMATE:
+                    return JSONResponse(content={"input_tokens": estimated_tokens})
+
+                original = get_original_endpoint(request)
+                if original is not None:
+                    try:
+                        native_response = await original(request=request)
+                        native_tokens = _extract_input_tokens(native_response)
+                        if native_tokens and native_tokens > 0:
+                            return JSONResponse(content={"input_tokens": native_tokens})
+                    except Exception as exc:
+                        log.warning("native messages count_tokens failed; using estimate: %s", exc)
+
+                return JSONResponse(content={"input_tokens": estimated_tokens})
+
+            for route_path in reversed(route_paths):
+                route = APIRoute(
+                    path=route_path,
+                    endpoint=opencode_messages_count_tokens,
+                    methods=["POST"],
+                    name=route_name,
+                    dependencies=[Depends(user_api_key_auth)],
+                )
+                app.router.routes.insert(0, route)
+
+            log.info("registered opencode compatibility routes %s", ", ".join(route_paths))
+        except Exception as exc:
+            log.warning("failed to register messages count_tokens compatibility route: %s", exc)
+
+    async def _deployment_lacks_stop_hook_grammar(self, api_base: str) -> bool:
+        capability_cache = getattr(self, "_stop_hook_capability_cache", None)
+        if capability_cache is None:
+            capability_cache = {}
+            self._stop_hook_capability_cache = capability_cache
+        now = time.monotonic()
+        cached = capability_cache.get(api_base)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+
+        info_url = _server_info_url(api_base)
+        if not info_url:
+            return False
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(
+                timeout=STOP_HOOK_CAPABILITY_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(info_url)
+                response.raise_for_status()
+                server_info = response.json()
+            unsupported = _server_info_lacks_grammar(server_info)
+            fingerprint = _server_info_fingerprint(server_info) if isinstance(server_info, dict) else ()
+            capability_cache[api_base] = (
+                now + STOP_HOOK_CAPABILITY_CACHE_SECONDS,
+                unsupported,
+                fingerprint,
+            )
+            return unsupported
+        except Exception as exc:
+            # Unknown/non-SGLang endpoints preserve their original structured
+            # output request. A short negative cache avoids adding latency to
+            # repeated Stop checks while an endpoint is unavailable.
+            capability_cache[api_base] = (
+                now + STOP_HOOK_CAPABILITY_ERROR_CACHE_SECONDS,
+                False,
+                (),
+            )
+            log.debug("Stop hook capability lookup failed for %s: %s", info_url, exc)
+            return False
+
+    async def async_pre_call_deployment_hook(self, kwargs: Dict[str, Any], call_type: Any) -> Optional[dict]:
+        request_probe = dict(kwargs)
+        if not request_probe.get("call_type"):
+            request_probe["call_type"] = str(getattr(call_type, "value", call_type) or "")
+        if not _is_stop_hook_json_evaluator(request_probe):
+            return None
+
+        api_base = _deployment_api_base(kwargs)
+        if not api_base or not await self._deployment_lacks_stop_hook_grammar(api_base):
+            return None
+        if _remove_stop_hook_structured_output(kwargs):
+            cached = getattr(self, "_stop_hook_capability_cache", {}).get(api_base)
+            fingerprint = cached[2] if cached is not None else ()
+            log.warning(
+                "disabled upstream structured output for Stop hook evaluator "
+                "because deployment lacks grammar support api_base=%s fingerprint=%s",
+                api_base,
+                fingerprint,
+            )
+            return kwargs
+        return None
+
+    async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: str):
+        _sanitize_request_tools(data, call_type)
+        if call_type == "anthropic_messages":
+            thinking = data.get("thinking")
+            if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+                budget = thinking.get("budget_tokens")
+                if isinstance(budget, int) and budget >= 10000:
+                    data["reasoning_effort"] = "high"
+                elif isinstance(budget, int) and budget >= 5000:
+                    data["reasoning_effort"] = "medium"
+                else:
+                    data["reasoning_effort"] = "low"
+                data.pop("thinking", None)
+            if data.get("stream") is None:
+                data["stream"] = True
+        if call_type in ("responses", "aresponses"):
+            _disable_responses_reasoning_merge(data)
+            hoisted = _hoist_system_responses_input(data)
+            if hoisted:
+                log.warning(
+                    "hoisted %d system/developer input items into instructions context=%s",
+                    hoisted,
+                    _request_context(data),
+                )
+            _sanitize_response_input_history(data)
+            _sanitize_malformed_function_call_history(data)
+
+        if call_type not in ("completion", "acompletion", "chat_completion", "anthropic_messages"):
+            return data
+
+        hoisted = _hoist_system_chat_messages(data.get("messages"))
+        if hoisted:
+            log.warning(
+                "hoisted %d system/developer messages into leading system message context=%s",
+                hoisted,
+                _request_context(data),
+            )
+        _sanitize_chat_internal_artifact_history(data)
+        _normalize_assistant_messages(data.get("messages"))
+        request_probe = dict(data)
+        request_probe["call_type"] = call_type
+        if _is_stop_hook_json_evaluator(request_probe):
+            request_context = _request_context(request_probe)
+            session_key = _stop_hook_session_key(request_probe, request_context)
+            _STOP_HOOK_REQUEST_STARTED_AT[_stop_hook_request_key(session_key)] = time.time()
+            # Merging provider reasoning into visible content can drop the
+            # first JSON fragment when one upstream delta contains both the
+            # final reasoning token and the first content token. Keep the two
+            # channels separate for typed Stop decisions only.
+            data["merge_reasoning_content_in_choices"] = False
+            dropped = _truncate_stop_hook_history(data)
+            if dropped:
+                log.info(
+                    "truncated Stop hook evaluator history by %d messages context=%s",
+                    dropped,
+                    request_context,
+                )
+            log.info(
+                "disabled reasoning-content merge for Stop hook evaluator context=%s",
+                request_context,
+            )
+        return data
+
+    async def async_pre_request_hook(self, model: str, messages: List[Any], kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if _is_codex_compaction_request(kwargs):
+            _disable_tools_for_compaction(kwargs)
+            return kwargs
+
+        if isinstance(kwargs, dict) and isinstance(kwargs.get("tools"), list):
+            kwargs["tools"] = _sanitize_chat_tools_for_upstream(kwargs["tools"])
+            _drop_empty_tools(kwargs)
+            return kwargs
+        return None
+
+    async def async_post_call_success_hook(self, data: dict, user_api_key_dict: Any, response: Any) -> Any:
+        return convert_non_streaming_response(response, _request_tool_schemas(data))
+
+    async def async_post_call_streaming_iterator_hook(
+        self, user_api_key_dict: Any, response: Any, request_data: dict
+    ) -> AsyncGenerator[Any, None]:
+        request_context = _request_context(request_data)
+        if _is_messages_stream(request_data):
+            converted_stream = self._convert_anthropic_messages_stream(
+                response,
+                stop_after_first_native_tool=_stop_after_first_native_tool(request_data),
+                request_context=request_context,
+                request_data=request_data,
+            )
+            try:
+                async for chunk in converted_stream:
+                    yield chunk
+            finally:
+                # Closing both levels is deliberate: converted_stream owns the
+                # keepalive iterator, while response owns the provider HTTP
+                # request. Neither object is LiteLLM's shared aiohttp session.
+                await _close_request_stream(converted_stream, request_context)
+                await _close_request_stream(response, request_context)
+            return
+
+        if _should_skip_stream_conversion(request_data):
+            async for chunk in response:
+                yield chunk
+            return
+
+        buffer = ""
+        unflushed_text = ""
+        pending: List[str] = []
+        dsml_mode = False
+        content_collected = False
+        raw_stream_passthrough = False
+        thinking_state = 0
+        raw_think = _raw_think_state()
+        tool_schemas = _request_tool_schemas(request_data)
+        last_id = "chatcmpl-opencode-compat"
+        last_model = request_data.get("model", "unknown") if request_data else "unknown"
+        last_created = int(time.time())
+        tool_call_state: Dict[Any, Dict[str, str]] = {}
+
+        async for chunk in response:
+            # Native passthrough streams can be bytes; leave them untouched.
+            if isinstance(chunk, (bytes, bytearray)):
+                raw_stream_passthrough = True
+                yield chunk
+                continue
+
+            if isinstance(chunk, str) and (chunk.startswith("data:") or chunk.startswith("event:")):
+                raw_stream_passthrough = True
+                yield chunk
+                continue
+
+            event_type = _get(chunk, "type", None)
+            if isinstance(event_type, str) and event_type.startswith("response."):
+                raw_stream_passthrough = True
+                yield chunk
+                continue
+
+            chunk_as_text = str(chunk)
+            if chunk_as_text.startswith("data:") or chunk_as_text.startswith("event:"):
+                raw_stream_passthrough = True
+                yield chunk
+                continue
+
+            last_id = _chunk_id(chunk, last_id)
+            last_model = _chunk_model(chunk, last_model)
+            last_created = _chunk_created(chunk, last_created)
+
+            delta = _delta(chunk)
+            _patch_tool_call_ids(delta, tool_call_state)
+            if _get(delta, "role", None):
+                yield chunk
+                continue
+
+            reasoning = _reasoning_from_delta(delta)
+            text = _content_from_delta(delta)
+            raw_chunk_text = reasoning or text
+
+            if not raw_chunk_text:
+                if not dsml_mode:
+                    yield chunk
+                continue
+
+            is_reasoning = bool(reasoning)
+            chunk_text = ""
+            if is_reasoning:
+                if thinking_state == 0:
+                    chunk_text += "<think>\n"
+                    thinking_state = 1
+                chunk_text += raw_chunk_text
+            else:
+                if thinking_state == 1:
+                    chunk_text += "\n</think>\n"
+                    thinking_state = 2
+                chunk_text += _strip_raw_think_delta(raw_chunk_text, raw_think)
+
+            if not chunk_text:
+                continue
+
+            previous_buffer_len = len(buffer)
+            buffer += chunk_text
+            content_collected = True
+
+            if has_complete_raw_tool_block(buffer):
+                idx = find_raw_tool_start(buffer)
+                if idx > 0:
+                    prefix = buffer[:idx]
+                    if thinking_state == 1:
+                        prefix += "\n</think>\n"
+                        thinking_state = 2
+                    yield _make_content_chunk(last_id, last_model, last_created, prefix)
+
+                parsed = parse_raw_tool_calls(normalize_raw_tool_calls(buffer))
+                if parsed:
+                    _coerce_tool_arguments_for_schemas(parsed, tool_schemas)
+                    log.info("converted %d streaming tool_calls", len(parsed))
+                    for out_chunk in build_stream_tool_call_chunks(parsed, last_id, last_model, last_created):
+                        yield out_chunk
+                else:
+                    log.warning("suppressing unparsable stream raw tool block: %s", buffer[idx:idx + 800])
+                    yield _make_stream_chunk(last_id, last_model, last_created, {"content": ""}, finish_reason="stop")
+                return
+
+            if dsml_mode:
+                continue
+
+            if has_any_dsml_prefix(buffer):
+                dsml_mode = True
+                idx = find_raw_tool_start(buffer)
+                if idx > 0:
+                    for item in pending:
+                        yield _make_content_chunk(last_id, last_model, last_created, item)
+                    if unflushed_text:
+                        yield _make_content_chunk(last_id, last_model, last_created, unflushed_text)
+                pending.clear()
+                unflushed_text = ""
+                if idx > previous_buffer_len:
+                    yield _make_content_chunk(last_id, last_model, last_created, buffer[previous_buffer_len:idx])
+                continue
+
+            unflushed_text += chunk_text
+            while len(unflushed_text) >= SECTION_SIZE:
+                pending.append(unflushed_text[:SECTION_SIZE])
+                unflushed_text = unflushed_text[SECTION_SIZE:]
+                if len(pending) > GUARD_SECTIONS:
+                    yield _make_content_chunk(last_id, last_model, last_created, pending.pop(0))
+
+        if thinking_state == 1:
+            unflushed_text += "\n</think>\n"
+
+        tail = _flush_raw_think_tail(raw_think)
+        if tail:
+            unflushed_text += tail
+        fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+        if fallback:
+            unflushed_text += fallback
+        placeholder = _empty_unclosed_raw_think_placeholder(
+            raw_think, request_context, pending, unflushed_text, False
+        )
+        if placeholder:
+            unflushed_text += placeholder
+
+        if dsml_mode:
+            if content_collected:
+                idx = find_raw_tool_start(buffer)
+                if idx > 0:
+                    yield _make_content_chunk(last_id, last_model, last_created, buffer[:idx])
+                if not has_complete_raw_tool_block(buffer) and idx < len(buffer):
+                    log.warning("suppressing incomplete stream raw tool block: %s", buffer[idx:idx + 800])
+        else:
+            for item in pending:
+                yield _make_content_chunk(last_id, last_model, last_created, item)
+            if unflushed_text:
+                yield _make_content_chunk(last_id, last_model, last_created, unflushed_text)
+
+        if raw_stream_passthrough and not content_collected:
+            return
+
+        yield _make_stream_chunk(last_id, last_model, last_created, {"content": ""}, finish_reason="stop")
+
+    async def _convert_anthropic_messages_stream(
+        self,
+        response: Any,
+        stop_after_first_native_tool: bool = False,
+        request_context: str = "unknown-request",
+        request_data: Optional[dict] = None,
+    ) -> AsyncGenerator[Any, None]:
+        text_buffer = ""
+        unflushed_text = ""
+        pending: List[str] = []
+        dsml_mode = False
+        sse_buffer = ""
+        text_block_index = 0
+        text_delta_type = "text_delta"
+        raw_think = _raw_think_state()
+        raw_think["tool_schemas"] = _request_tool_schemas(request_data)
+        native_tool_index: Optional[int] = None
+        native_tool_json = ""
+        passthrough_blocked = False
+        original_for_output: Any = b""
+        open_content_blocks: set[int] = set()
+        saw_content_block = False
+        openai_tool_state: Dict[int, Dict[str, str]] = {}
+        saw_message_stop = False
+        saw_stop_message_delta = False
+        saw_message_start = False
+        synthetic_stop_sent = False
+        stop_hook_json_evaluator = _is_stop_hook_json_evaluator(request_data)
+        stop_hook_session_key = _stop_hook_session_key(request_data, request_context)
+        stop_hook_visible_text = False
+        stop_hook_text_buffer = ""
+        stop_hook_started_at = time.time()
+        if stop_hook_json_evaluator:
+            started_key = _stop_hook_request_key(stop_hook_session_key)
+            stop_hook_started_at = _STOP_HOOK_REQUEST_STARTED_AT.pop(started_key, stop_hook_started_at)
+        stop_hook_last_progress_at = stop_hook_started_at
+        openai_sse_mode = False
+
+        keepalive_seconds = STOP_HOOK_KEEPALIVE_SECONDS if stop_hook_json_evaluator else MESSAGES_STREAM_KEEPALIVE_SECONDS
+
+        force_keepalive_at = None
+        if stop_hook_json_evaluator:
+            force_keepalive_at = stop_hook_started_at + STOP_HOOK_JSON_FALLBACK_SECONDS
+
+        async for chunk in _iter_with_keepalive(
+            response,
+            request_context,
+            keepalive_seconds=keepalive_seconds,
+            force_keepalive_at=force_keepalive_at,
+        ):
+            original_for_output = chunk
+            if stop_after_first_native_tool:
+                complete_openai_tool = _first_complete_openai_tool_call(openai_tool_state, _delta(chunk))
+                if complete_openai_tool:
+                    for index in sorted(open_content_blocks):
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
+                    tool_index = max(open_content_blocks | {text_block_index}) + 1 if saw_content_block else 0
+                    for event in _messages_tool_use_events([complete_openai_tool], tool_index, chunk):
+                        yield event
+                    log.info("synthesized messages native tool stop from OpenAI stream context=%s", request_context)
+                    return
+
+            chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+            sse_buffer += chunk_text
+
+            while "\n\n" in sse_buffer:
+                raw_event, sse_buffer = sse_buffer.split("\n\n", 1)
+                if not raw_event:
+                    continue
+
+                event_name, payload = _parse_sse_event(raw_event)
+                if payload is None:
+                    if openai_sse_mode and "[DONE]" in raw_event:
+                        if not saw_message_stop and not synthetic_stop_sent:
+                            if (
+                                stop_hook_json_evaluator
+                                and not stop_hook_visible_text
+                                and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
+                            ):
+                                for event in _messages_text_end_turn_events(
+                                    _stop_hook_json_fallback_text(),
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_json_fallback(
+                                    stop_hook_session_key,
+                                    request_context,
+                                    "done-without-text",
+                                )
+                                log.warning(
+                                    "synthesized Stop hook JSON fallback after empty [DONE] stream context=%s "
+                                    "thinking_chars=%s",
+                                    request_context,
+                                    raw_think.get("suppressed_chars") or 0,
+                                )
+                                return
+                            events, pending, unflushed_text = _yield_unclosed_think_completion(
+                                raw_think,
+                                pending,
+                                unflushed_text,
+                                text_block_index,
+                                text_delta_type,
+                                chunk,
+                                request_context,
+                                any(bool(entry.get("name")) for entry in openai_tool_state.values()),
+                                open_content_blocks,
+                            )
+                            for event in events:
+                                yield event
+                            for index in sorted(open_content_blocks):
+                                yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
+                            if not saw_stop_message_delta:
+                                yield _sse(
+                                    "message_delta",
+                                    {
+                                        "type": "message_delta",
+                                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                        "usage": {"output_tokens": 0},
+                                    },
+                                    chunk,
+                                )
+                            yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                            synthetic_stop_sent = True
+                        continue
+                    if not passthrough_blocked:
+                        yield _encode_like(raw_event + "\n\n", chunk)
+                    if (
+                        stop_hook_json_evaluator
+                        and not stop_hook_visible_text
+                        and _stop_hook_json_fallback_due(
+                            stop_hook_started_at,
+                            stop_hook_last_progress_at,
+                        )
+                        and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
+                    ):
+                        for event in _messages_text_end_turn_events(
+                            _stop_hook_json_fallback_text(),
+                            STOP_HOOK_CLIENT_BLOCK_INDEX,
+                            chunk,
+                            start_block=not saw_content_block,
+                        ):
+                            yield event
+                        _record_stop_hook_json_fallback(
+                            stop_hook_session_key,
+                            request_context,
+                            "empty-stream",
+                        )
+                        log.warning("synthesized Stop hook JSON fallback after empty stream context=%s", request_context)
+                        return
+                    continue
+
+                if event_name in (None, "") and _choice(payload) is not None:
+                    openai_sse_mode = True
+                    passthrough_blocked = True
+                    if not saw_message_start:
+                        yield _sse(
+                            "message_start",
+                            _message_start_with_estimated_usage(
+                                {
+                                    "type": "message_start",
+                                    "message": {
+                                        "id": _chunk_id(payload, "msg_opencode_compat"),
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "model": _chunk_model(payload, "unknown"),
+                                        "content": [],
+                                        "stop_reason": None,
+                                        "stop_sequence": None,
+                                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                                    },
+                                },
+                                request_data,
+                            ),
+                            chunk,
+                        )
+                        saw_message_start = True
+
+                    delta = _delta(payload)
+                    complete_openai_tool = _first_complete_openai_tool_call(openai_tool_state, delta)
+                    if complete_openai_tool:
+                        for index in sorted(open_content_blocks):
+                            yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
+                        tool_index = max(open_content_blocks | {text_block_index}) + 1 if saw_content_block else 0
+                        for event in _messages_tool_use_events([complete_openai_tool], tool_index, chunk):
+                            yield event
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                                "usage": {"output_tokens": 0},
+                            },
+                            chunk,
+                        )
+                        yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                        synthetic_stop_sent = True
+                        log.info("synthesized messages native tool stop from OpenAI SSE context=%s", request_context)
+                        return
+
+                    content_text = _content_from_delta(delta)
+                    reasoning_text = _reasoning_from_delta(delta)
+                    chunk_text = content_text or reasoning_text
+                    if chunk_text:
+                        if stop_hook_json_evaluator:
+                            stop_hook_last_progress_at = time.time()
+                            # The Stop evaluator's response schema applies to visible
+                            # content only. Never prepend provider reasoning to the JSON
+                            # buffer; doing so makes a correct final object unparsable.
+                            if not content_text:
+                                if (
+                                    _stop_hook_json_fallback_due(
+                                        stop_hook_started_at,
+                                        stop_hook_last_progress_at,
+                                    )
+                                    and _stop_hook_json_fallback_available(
+                                        stop_hook_session_key, request_context
+                                    )
+                                ):
+                                    for event in _messages_text_end_turn_events(
+                                        _stop_hook_json_fallback_text(),
+                                        STOP_HOOK_CLIENT_BLOCK_INDEX,
+                                        chunk,
+                                        start_block=not saw_content_block,
+                                    ):
+                                        yield event
+                                    _record_stop_hook_json_fallback(
+                                        stop_hook_session_key,
+                                        request_context,
+                                        "reasoning-only-openai",
+                                    )
+                                    return
+                                continue
+                            stop_hook_text_buffer += content_text
+                            valid_stop_hook_json = _extract_valid_stop_hook_json_text(
+                                stop_hook_text_buffer
+                            )
+                            if valid_stop_hook_json is not None:
+                                stop_hook_visible_text = True
+                                for event in _messages_text_end_turn_events(
+                                    valid_stop_hook_json,
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_valid_json(stop_hook_session_key, request_context)
+                                log.info(
+                                    "emitted buffered valid Stop hook JSON context=%s",
+                                    request_context,
+                                )
+                                return
+                            if (
+                                _stop_hook_json_fallback_due(
+                                    stop_hook_started_at,
+                                    stop_hook_last_progress_at,
+                                )
+                                and _stop_hook_json_fallback_available(
+                                    stop_hook_session_key, request_context
+                                )
+                            ):
+                                for event in _messages_text_end_turn_events(
+                                    _stop_hook_json_fallback_text(),
+                                    text_block_index,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_json_fallback(
+                                    stop_hook_session_key,
+                                    request_context,
+                                    "invalid-buffered-openai-text",
+                                )
+                                log.warning(
+                                    "synthesized Stop hook JSON fallback after invalid "
+                                    "buffered OpenAI text context=%s chars=%s",
+                                    request_context,
+                                    len(stop_hook_text_buffer),
+                                )
+                                return
+                            continue
+                        if not saw_content_block:
+                            yield _sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": text_block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                },
+                                chunk,
+                            )
+                            saw_content_block = True
+                            open_content_blocks.add(text_block_index)
+                        async for item in self._handle_messages_text_delta(
+                            chunk_text,
+                            text_block_index,
+                            chunk,
+                            "text_delta",
+                            state={
+                                "text_buffer": text_buffer,
+                                "unflushed_text": unflushed_text,
+                                "pending": pending,
+                                "dsml_mode": dsml_mode,
+                                "raw_think": raw_think,
+                            },
+                        ):
+                            if isinstance(item, dict) and item.get("_state"):
+                                text_buffer = item["text_buffer"]
+                                unflushed_text = item["unflushed_text"]
+                                pending = item["pending"]
+                                dsml_mode = item["dsml_mode"]
+                                raw_think = item["raw_think"]
+                                passthrough_blocked = item["passthrough_blocked"]
+                                synthetic_stop_sent = synthetic_stop_sent or bool(item.get("stop_sent"))
+                            else:
+                                yield item
+
+                    choice = _choice(payload)
+                    finish_reason = _get(choice, "finish_reason", None)
+                    if finish_reason:
+                        events, pending, unflushed_text = _yield_unclosed_think_completion(
+                            raw_think,
+                            pending,
+                            unflushed_text,
+                            text_block_index,
+                            text_delta_type,
+                            chunk,
+                            request_context,
+                            any(bool(entry.get("name")) for entry in openai_tool_state.values()),
+                            open_content_blocks,
+                        )
+                        for event in events:
+                            yield event
+                        for index in sorted(open_content_blocks):
+                            yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, chunk)
+                        open_content_blocks.clear()
+                        stop_reason = "tool_use" if str(finish_reason) == "tool_calls" else "end_turn"
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                                "usage": {"output_tokens": 0},
+                            },
+                            chunk,
+                        )
+                        yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                        saw_stop_message_delta = True
+                        saw_message_stop = True
+                        synthetic_stop_sent = True
+                        return
+                    continue
+
+                if event_name == "content_block_delta":
+                    delta = payload.get("delta") or {}
+                    delta_type = str(delta.get("type") or "")
+                    delta_field = "thinking" if delta_type == "thinking_delta" else "text"
+                    if delta_type in {"text_delta", "thinking_delta"} and isinstance(delta.get(delta_field), str):
+                        text_block_index = _event_index(payload, text_block_index)
+                        text_delta_type = delta_type
+                        if stop_hook_json_evaluator and delta_type == "thinking_delta":
+                            stop_hook_last_progress_at = time.time()
+                            if raw_think.get("started_at") is None:
+                                raw_think["started_at"] = time.time()
+                            _record_raw_think_suppressed(delta[delta_field], raw_think)
+                            if (
+                                not stop_hook_visible_text
+                                and _stop_hook_json_fallback_due(
+                                    stop_hook_started_at,
+                                    stop_hook_last_progress_at,
+                                )
+                                and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
+                            ):
+                                for event in _messages_text_end_turn_events(
+                                    _stop_hook_json_fallback_text(),
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_json_fallback(
+                                    stop_hook_session_key,
+                                    request_context,
+                                    "reasoning-only",
+                                )
+                                log.warning(
+                                    "synthesized Stop hook JSON fallback after reasoning-only stream context=%s chars=%s",
+                                    request_context,
+                                    raw_think.get("suppressed_chars") or 0,
+                                )
+                                return
+                            continue
+                        if (
+                            stop_hook_json_evaluator
+                            and delta_type == "text_delta"
+                            and delta[delta_field]
+                        ):
+                            stop_hook_last_progress_at = time.time()
+                            stop_hook_text_buffer += delta[delta_field]
+                            valid_stop_hook_json = _extract_valid_stop_hook_json_text(
+                                stop_hook_text_buffer
+                            )
+                            if valid_stop_hook_json is not None:
+                                stop_hook_visible_text = True
+                                for event in _messages_text_end_turn_events(
+                                    valid_stop_hook_json,
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_valid_json(stop_hook_session_key, request_context)
+                                log.info(
+                                    "emitted buffered valid Stop hook JSON context=%s",
+                                    request_context,
+                                )
+                                return
+                            if (
+                                _stop_hook_json_fallback_due(
+                                    stop_hook_started_at,
+                                    stop_hook_last_progress_at,
+                                )
+                                and _stop_hook_json_fallback_available(
+                                    stop_hook_session_key, request_context
+                                )
+                            ):
+                                for event in _messages_text_end_turn_events(
+                                    _stop_hook_json_fallback_text(),
+                                    STOP_HOOK_CLIENT_BLOCK_INDEX,
+                                    chunk,
+                                    start_block=not saw_content_block,
+                                ):
+                                    yield event
+                                _record_stop_hook_json_fallback(
+                                    stop_hook_session_key,
+                                    request_context,
+                                    "invalid-buffered-anthropic-text",
+                                )
+                                log.warning(
+                                    "synthesized Stop hook JSON fallback after invalid "
+                                    "buffered Anthropic text context=%s chars=%s",
+                                    request_context,
+                                    len(stop_hook_text_buffer),
+                                )
+                                return
+                            continue
+                        async for item in self._handle_messages_text_delta(
+                            delta[delta_field],
+                            text_block_index,
+                            chunk,
+                            delta_type,
+                            state={
+                                "text_buffer": text_buffer,
+                                "unflushed_text": unflushed_text,
+                                "pending": pending,
+                                "dsml_mode": dsml_mode,
+                                "raw_think": raw_think,
+                            },
+                        ):
+                            if isinstance(item, dict) and item.get("_state"):
+                                text_buffer = item["text_buffer"]
+                                unflushed_text = item["unflushed_text"]
+                                pending = item["pending"]
+                                dsml_mode = item["dsml_mode"]
+                                raw_think = item["raw_think"]
+                                passthrough_blocked = item["passthrough_blocked"]
+                                synthetic_stop_sent = synthetic_stop_sent or bool(item.get("stop_sent"))
+                            else:
+                                yield item
+                        continue
+                    if (
+                        stop_after_first_native_tool
+                        and native_tool_index is not None
+                        and _event_index(payload, -1) == native_tool_index
+                        and delta.get("type") == "input_json_delta"
+                        and isinstance(delta.get("partial_json"), str)
+                    ):
+                        native_tool_json += delta["partial_json"]
+
+                if dsml_mode or passthrough_blocked:
+                    continue
+
+                if stop_hook_json_evaluator and event_name == "content_block_start":
+                    content_block = payload.get("content_block") or {}
+                    start_text = content_block.get("text")
+                    if isinstance(start_text, str) and start_text:
+                        stop_hook_last_progress_at = time.time()
+                        stop_hook_text_buffer += start_text
+                        valid_stop_hook_json = _extract_valid_stop_hook_json_text(
+                            stop_hook_text_buffer
+                        )
+                        if valid_stop_hook_json is not None:
+                            stop_hook_visible_text = True
+                            for event in _messages_text_end_turn_events(
+                                valid_stop_hook_json,
+                                STOP_HOOK_CLIENT_BLOCK_INDEX,
+                                chunk,
+                                start_block=True,
+                            ):
+                                yield event
+                            _record_stop_hook_valid_json(
+                                stop_hook_session_key, request_context
+                            )
+                            log.info(
+                                "emitted content-block-start Stop hook JSON context=%s",
+                                request_context,
+                            )
+                            return
+
+                # The evaluator response is buffered until one complete typed
+                # decision is available. Forward message_start for protocol
+                # framing, but suppress upstream content/terminal frames so a
+                # reasoning-only or malformed answer cannot close the client
+                # stream before the canonical decision (or fallback) is sent.
+                if stop_hook_json_evaluator and event_name in {
+                    "content_block_start",
+                    "content_block_stop",
+                    "message_delta",
+                    "message_stop",
+                }:
+                    continue
+
+                if event_name == "content_block_start":
+                    saw_content_block = True
+                    text_block_index = _event_index(payload, text_block_index)
+                    open_content_blocks.add(text_block_index)
+                    content_block = payload.get("content_block") or {}
+                    if content_block.get("type") == "tool_use" and native_tool_index is None:
+                        native_tool_index = text_block_index
+                elif event_name == "content_block_stop":
+                    open_content_blocks.discard(_event_index(payload, text_block_index))
+
+                if event_name in {"content_block_stop", "message_delta", "message_stop"}:
+                    tail = _flush_raw_think_tail(raw_think)
+                    if tail:
+                        unflushed_text += tail
+                    fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+                    if fallback:
+                        yield _messages_text_delta(fallback, text_block_index, chunk, "text_delta")
+                    if event_name == "message_delta":
+                        delta = payload.get("delta") or {}
+                        stop_reason = delta.get("stop_reason")
+                        if stop_reason:
+                            saw_stop_message_delta = True
+                        if stop_reason == "end_turn":
+                            placeholder = _empty_unclosed_raw_think_placeholder(
+                                raw_think,
+                                request_context,
+                                pending,
+                                unflushed_text,
+                                native_tool_index is not None,
+                            )
+                            if placeholder:
+                                if text_block_index in open_content_blocks:
+                                    yield _messages_text_delta(
+                                        placeholder, text_block_index, chunk, text_delta_type
+                                    )
+                                else:
+                                    placeholder_index = text_block_index + 1
+                                    yield _sse(
+                                        "content_block_start",
+                                        {
+                                            "type": "content_block_start",
+                                            "index": placeholder_index,
+                                            "content_block": {"type": "text", "text": ""},
+                                        },
+                                        chunk,
+                                    )
+                                    yield _messages_text_delta(
+                                        placeholder, placeholder_index, chunk, "text_delta"
+                                    )
+                                    yield _sse(
+                                        "content_block_stop",
+                                        {"type": "content_block_stop", "index": placeholder_index},
+                                        chunk,
+                                    )
+                        elif raw_think.get("in_think"):
+                            _warn_unclosed_raw_think(raw_think, request_context)
+                    elif event_name == "message_stop" and raw_think.get("in_think"):
+                        _warn_unclosed_raw_think(raw_think, request_context)
+                    if event_name == "message_stop":
+                        saw_message_stop = True
+                    for item in pending:
+                        yield _messages_text_delta(item, text_block_index, chunk, text_delta_type)
+                    pending = []
+                    if unflushed_text:
+                        if stop_hook_json_evaluator and unflushed_text.strip():
+                            stop_hook_visible_text = True
+                        yield _messages_text_delta(unflushed_text, text_block_index, chunk, text_delta_type)
+                        unflushed_text = ""
+                    text_buffer = ""
+                    if event_name == "message_stop" and not saw_stop_message_delta:
+                        placeholder = _empty_unclosed_raw_think_placeholder(
+                            raw_think,
+                            request_context,
+                            pending,
+                            unflushed_text,
+                            native_tool_index is not None,
+                        )
+                        if placeholder:
+                            if text_block_index in open_content_blocks:
+                                yield _messages_text_delta(
+                                    placeholder, text_block_index, chunk, text_delta_type
+                                )
+                            else:
+                                placeholder_index = text_block_index + 1
+                                yield _sse(
+                                    "content_block_start",
+                                    {
+                                        "type": "content_block_start",
+                                        "index": placeholder_index,
+                                        "content_block": {"type": "text", "text": ""},
+                                    },
+                                    chunk,
+                                )
+                                yield _messages_text_delta(
+                                    placeholder, placeholder_index, chunk, "text_delta"
+                                )
+                                yield _sse(
+                                    "content_block_stop",
+                                    {"type": "content_block_stop", "index": placeholder_index},
+                                    chunk,
+                                )
+                        for index in sorted(open_content_blocks):
+                            yield _sse(
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": index},
+                                chunk,
+                            )
+                        open_content_blocks.clear()
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                "usage": {"output_tokens": 0},
+                            },
+                            chunk,
+                        )
+                        saw_stop_message_delta = True
+
+                if event_name == "message_start":
+                    if saw_message_start:
+                        tail = _flush_raw_think_tail(raw_think)
+                        if tail:
+                            unflushed_text += tail
+                        fallback = _hidden_thinking_final_fallback(raw_think, pending, unflushed_text)
+                        if fallback:
+                            unflushed_text += fallback
+                        if raw_think.get("in_think"):
+                            _warn_unclosed_raw_think(raw_think, request_context)
+                        for item in pending:
+                            yield _messages_text_delta(
+                                item,
+                                text_block_index,
+                                chunk,
+                                text_delta_type,
+                            )
+                        if unflushed_text:
+                            yield _messages_text_delta(
+                                unflushed_text,
+                                text_block_index,
+                                chunk,
+                                text_delta_type,
+                            )
+                        for index in sorted(open_content_blocks):
+                            yield _sse(
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": index},
+                                chunk,
+                            )
+                        yield _sse(
+                            "message_delta",
+                            {
+                                "type": "message_delta",
+                                "delta": {
+                                    "stop_reason": "end_turn",
+                                    "stop_sequence": None,
+                                },
+                                "usage": {"output_tokens": 0},
+                            },
+                            chunk,
+                        )
+                        yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                        log.warning(
+                            "terminated messages stream before duplicate message_start "
+                            "from transparent upstream retry context=%s",
+                            request_context,
+                        )
+                        return
+                    saw_message_start = True
+                    yield _sse(
+                        event_name,
+                        _message_start_with_estimated_usage(payload, request_data),
+                        chunk,
+                    )
+                else:
+                    yield _encode_like(raw_event + "\n\n", chunk)
+
+                if (
+                    stop_after_first_native_tool
+                    and native_tool_index is not None
+                    and event_name == "content_block_delta"
+                    and _is_complete_json_object(native_tool_json)
+                ):
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": native_tool_index}, chunk)
+                    yield _sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                            "usage": {"output_tokens": 0},
+                        },
+                        chunk,
+                    )
+                    yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                    log.info("synthesized messages native tool stop from Anthropic SSE context=%s", request_context)
+                    return
+
+                if (
+                    stop_after_first_native_tool
+                    and native_tool_index is not None
+                    and event_name == "content_block_stop"
+                    and _event_index(payload, -1) == native_tool_index
+                ):
+                    yield _sse(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                            "usage": {"output_tokens": 0},
+                        },
+                        chunk,
+                    )
+                    yield _sse("message_stop", {"type": "message_stop"}, chunk)
+                    return
+
+        if dsml_mode:
+            idx = find_raw_tool_start(text_buffer)
+            visible_prefix = text_buffer[:idx] if idx > 0 else ""
+            if idx > 0:
+                yield _messages_text_delta(visible_prefix, text_block_index, original_for_output, text_delta_type)
+            if idx < len(text_buffer):
+                log.warning(
+                    "suppressing incomplete messages raw tool block context=%s preview=%r",
+                    request_context,
+                    text_buffer[idx:idx + 800].replace("\n", "\\n"),
+                )
+                if (
+                    stop_hook_json_evaluator
+                    and not synthetic_stop_sent
+                    and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
+                ):
+                    for event in _messages_text_end_turn_events(
+                        _stop_hook_json_fallback_text(),
+                        STOP_HOOK_CLIENT_BLOCK_INDEX,
+                        original_for_output,
+                        start_block=not saw_content_block,
+                    ):
+                        yield event
+                    _record_stop_hook_json_fallback(
+                        stop_hook_session_key,
+                        request_context,
+                        "incomplete-raw-tool",
+                    )
+                    log.warning(
+                        "synthesized Stop hook JSON fallback after incomplete raw tool block context=%s",
+                        request_context,
+                    )
+                    return
+                if not any(bool(item) for item in pending) and not unflushed_text and not visible_prefix.strip():
+                    for event in _messages_text_end_turn_events(
+                        _incomplete_raw_tool_fallback_text(),
+                        text_block_index,
+                        original_for_output,
+                        start_block=not saw_content_block,
+                    ):
+                        yield event
+                    log.warning(
+                        "synthesized malformed fallback after incomplete raw tool block context=%s",
+                        request_context,
+                    )
+                    return
+        else:
+            if stop_hook_json_evaluator and not stop_hook_visible_text:
+                tail = _flush_raw_think_tail(raw_think)
+                if tail:
+                    unflushed_text += tail
+                if raw_think.get("in_think"):
+                    _warn_unclosed_raw_think(raw_think, request_context)
+                for item in pending:
+                    yield _messages_text_delta(item, text_block_index, original_for_output, text_delta_type)
+                if unflushed_text:
+                    yield _messages_text_delta(unflushed_text, text_block_index, original_for_output, text_delta_type)
+            else:
+                events, pending, unflushed_text = _yield_unclosed_think_completion(
+                    raw_think,
+                    pending,
+                    unflushed_text,
+                    text_block_index,
+                    text_delta_type,
+                    original_for_output,
+                    request_context,
+                    any(bool(entry.get("name")) for entry in openai_tool_state.values()),
+                    open_content_blocks,
+                )
+                for event in events:
+                    yield event
+
+        if sse_buffer and not passthrough_blocked:
+            yield _encode_like(sse_buffer, original_for_output)
+
+        if (
+            stop_hook_json_evaluator
+            and not stop_hook_visible_text
+            and not synthetic_stop_sent
+            and _stop_hook_json_fallback_available(stop_hook_session_key, request_context)
+        ):
+            for event in _messages_text_end_turn_events(
+                _stop_hook_json_fallback_text(),
+                STOP_HOOK_CLIENT_BLOCK_INDEX,
+                original_for_output,
+                start_block=not saw_content_block,
+            ):
+                yield event
+            _record_stop_hook_json_fallback(
+                stop_hook_session_key,
+                request_context,
+                "stream-end",
+            )
+            log.warning(
+                "synthesized Stop hook JSON fallback at stream end context=%s "
+                "thinking_chars=%s text_chars=%s text_preview=%r "
+                "residual_chars=%s residual_preview=%r",
+                request_context,
+                raw_think.get("suppressed_chars") or 0,
+                len(stop_hook_text_buffer),
+                stop_hook_text_buffer[:1000].replace("\n", "\\n"),
+                len(sse_buffer),
+                sse_buffer[:500].replace("\n", "\\n"),
+            )
+            return
+
+        if not saw_message_stop and not synthetic_stop_sent:
+            for index in sorted(open_content_blocks):
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": index}, original_for_output)
+            if not saw_stop_message_delta:
+                yield _sse(
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": 0},
+                    },
+                    original_for_output,
+                )
+            yield _sse("message_stop", {"type": "message_stop"}, original_for_output)
+            log.warning("synthesized missing messages stream stop context=%s", request_context)
+
+    async def _handle_messages_text_delta(
+        self,
+        text: str,
+        text_block_index: int,
+        original: Any,
+        delta_type: str,
+        state: Dict[str, Any],
+    ) -> AsyncGenerator[Any, None]:
+        text_buffer = state["text_buffer"]
+        unflushed_text = state["unflushed_text"]
+        pending: List[str] = state["pending"]
+        dsml_mode = state["dsml_mode"]
+        raw_think = state["raw_think"]
+        passthrough_blocked = False
+
+        if delta_type == "thinking_delta":
+            if raw_think.get("started_at") is None:
+                raw_think["started_at"] = time.time()
+            # Structured thinking deltas are already visible to the client as a
+            # thinking block. They must not count as suppressed hidden thinking:
+            # the reveal path would duplicate them into the visible answer text
+            # and the final fallback would dump the preview into the transcript.
+            raw_think["forwarded_thinking_chars"] = (
+                int(raw_think.get("forwarded_thinking_chars") or 0) + len(text)
+            )
+            yield _messages_text_delta(text, text_block_index, original, "thinking_delta")
+            yield {
+                "_state": True,
+                "text_buffer": text_buffer,
+                "unflushed_text": unflushed_text,
+                "pending": pending,
+                "dsml_mode": dsml_mode,
+                "raw_think": raw_think,
+                "passthrough_blocked": passthrough_blocked,
+            }
+            return
+
+        raw_think["_revealed_delta"] = False
+        if dsml_mode:
+            safe_text = text
+            revealed_hidden_delta = False
+        else:
+            # Raw tool parsing must only see visible assistant content. If a model emits
+            # "<think>\n<tool_call>" without closing the thought, the tool prefix should
+            # remain suppressed with the hidden text instead of leaking a bare <think>.
+            safe_text = _strip_raw_think_delta(text, raw_think)
+            revealed_hidden_delta = bool(raw_think.pop("_revealed_delta", False))
+        previous_text_len = len(text_buffer)
+        text_buffer += safe_text
+
+        implicit_tool_candidate = bool(raw_think.get("implicit_tool_boundary"))
+        if (
+            (not revealed_hidden_delta or implicit_tool_candidate)
+            and has_complete_raw_tool_block(text_buffer)
+        ):
+            idx = find_raw_tool_start(text_buffer)
+            if idx > 0 and not dsml_mode:
+                yield _messages_text_delta(text_buffer[:idx], text_block_index, original, delta_type)
+
+            parsed = parse_raw_tool_calls(normalize_raw_tool_calls(text_buffer))
+            if parsed:
+                _coerce_tool_arguments_for_schemas(parsed, raw_think.get("tool_schemas") or {})
+            implicit_tool_boundary = bool(raw_think.pop("implicit_tool_boundary", False))
+            validation_error = ""
+            if parsed and implicit_tool_boundary:
+                valid, validation_error = _validate_implicit_tool_calls(
+                    parsed, raw_think.get("tool_schemas") or {}
+                )
+                if not valid:
+                    parsed = []
+            if parsed:
+                for p in parsed:
+                    pf = p.get("function", {})
+                    log.info(
+                        "parsed_raw_tool name=%r implicit_think_close=%s args_preview=%s",
+                        pf.get("name"),
+                        implicit_tool_boundary,
+                        str(pf.get("arguments", ""))[:200],
+                    )
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index}, original)
+                for event in _messages_tool_use_events(parsed, text_block_index + 1, original):
+                    yield event
+                yield {
+                    "_state": True,
+                    "text_buffer": "",
+                    "unflushed_text": "",
+                    "pending": [],
+                    "dsml_mode": True,
+                    "raw_think": raw_think,
+                    "passthrough_blocked": True,
+                    "stop_sent": True,
+                }
+                return
+
+            if implicit_tool_boundary and validation_error:
+                log.warning(
+                    "rejecting implicit-think tool recovery reason=%s preview=%r",
+                    validation_error,
+                    text_buffer[idx:idx + 800].replace("\n", "\\n"),
+                )
+                yield _messages_text_delta(
+                    "model output malformed: a tool call inside unclosed reasoning "
+                    f"was rejected ({validation_error}). Retry this step.",
+                    text_block_index,
+                    original,
+                    delta_type,
+                )
+                for event in _messages_end_turn_events(text_block_index, original):
+                    yield event
+                yield {
+                    "_state": True,
+                    "text_buffer": "",
+                    "unflushed_text": "",
+                    "pending": [],
+                    "dsml_mode": True,
+                    "raw_think": raw_think,
+                    "passthrough_blocked": True,
+                    "stop_sent": True,
+                }
+                return
+
+            log.warning(
+                "suppressing unparsable messages raw tool block preview=%r",
+                text_buffer[idx:idx + 800].replace("\n", "\\n"),
+            )
+            for event in _messages_end_turn_events(text_block_index, original):
+                yield event
+            yield {
+                "_state": True,
+                "text_buffer": "",
+                "unflushed_text": "",
+                "pending": [],
+                "dsml_mode": True,
+                "raw_think": raw_think,
+                "passthrough_blocked": True,
+                "stop_sent": True,
+            }
+            return
+
+        if dsml_mode:
+            yield {
+                "_state": True,
+                "text_buffer": text_buffer,
+                "unflushed_text": unflushed_text,
+                "pending": pending,
+                "dsml_mode": dsml_mode,
+                "raw_think": raw_think,
+                "passthrough_blocked": True,
+            }
+            return
+
+        if not revealed_hidden_delta and has_any_dsml_prefix(text_buffer):
+            dsml_mode = True
+            passthrough_blocked = True
+            idx = find_raw_tool_start(text_buffer)
+            if idx > 0:
+                for item in pending:
+                    yield _messages_text_delta(item, text_block_index, original, delta_type)
+                if unflushed_text:
+                    yield _messages_text_delta(unflushed_text, text_block_index, original, delta_type)
+            pending = []
+            unflushed_text = ""
+            if idx > previous_text_len:
+                yield _messages_text_delta(text_buffer[previous_text_len:idx], text_block_index, original, delta_type)
+            if idx < len(text_buffer):
+                text_buffer = text_buffer[idx:]
+            yield {
+                "_state": True,
+                "text_buffer": text_buffer,
+                "unflushed_text": unflushed_text,
+                "pending": pending,
+                "dsml_mode": dsml_mode,
+                "raw_think": raw_think,
+                "passthrough_blocked": passthrough_blocked,
+            }
+            return
+
+        unflushed_text += safe_text
+        while len(unflushed_text) >= SECTION_SIZE:
+            pending.append(unflushed_text[:SECTION_SIZE])
+            unflushed_text = unflushed_text[SECTION_SIZE:]
+            if len(pending) > GUARD_SECTIONS:
+                yield _messages_text_delta(pending.pop(0), text_block_index, original, delta_type)
+
+        yield {
+            "_state": True,
+            "text_buffer": text_buffer,
+            "unflushed_text": unflushed_text,
+            "pending": pending,
+            "dsml_mode": dsml_mode,
+            "raw_think": raw_think,
+            "passthrough_blocked": passthrough_blocked,
+        }
+
+
+proxy_handler_instance = OpencodeCompatHandler()
