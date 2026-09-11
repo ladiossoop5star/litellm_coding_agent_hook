@@ -1,0 +1,35 @@
+services:
+  litellm:
+    image: docker.litellm.ai/berriai/litellm:main-stable
+    container_name: litellm
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./opencode_compat_hook:/app/opencode_compat_hook:ro
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "4000"
+      - "--num_workers"
+      - "1"
+      - "--timeout_worker_healthcheck"
+      - "60"
+
+  nginx:
+    image: nginx:alpine
+    container_name: litellm-nginx
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - litellm

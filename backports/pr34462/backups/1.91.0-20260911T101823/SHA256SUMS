@@ -1,0 +1,6 @@
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  backports/pr34462/backups/1.91.0-20260911T101823/SHA256SUMS
+c54928833786ef20d239db63e55da30bdf0357f576d306b04acb5b3c090384f8  backports/pr34462/backups/1.91.0-20260911T101823/docker-compose.yml
+db57dd5a24135567b6c79fc53f0ce666fef1b8188a4cc16dbc7e0f29c80d1026  backports/pr34462/backups/1.91.0-20260911T101823/litellm/litellm_core_utils/prompt_templates/common_utils.py
+fcc35b960e113657c801642ec3cc24b5fc62708ba9cfaf6c340a4a22efae2cd7  backports/pr34462/backups/1.91.0-20260911T101823/litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py
+a2a90b622eac7e48804df6842891a0143a43994ba380a8c5df5d4bd91d811344  backports/pr34462/backups/1.91.0-20260911T101823/litellm/llms/openai/chat/gpt_transformation.py
+7a26864a3a532fceb272296f161ca25a44d85d35fe7cf2c301715f54042bcd18  backports/pr34462/backups/1.91.0-20260911T101823/litellm/types/llms/openai.py
