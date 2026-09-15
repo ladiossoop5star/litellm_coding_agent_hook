@@ -2687,8 +2687,17 @@ class OpencodeCompatHandler(CustomLogger):
         last_model = request_data.get("model", "unknown") if request_data else "unknown"
         last_created = int(time.time())
         tool_call_state: Dict[Any, Dict[str, str]] = {}
+        deferred_finish_chunk: Any = None
+        post_finish_chunks: List[Any] = []
 
         async for chunk in response:
+            # Some clients stop consuming as soon as they see finish_reason.
+            # Keep the provider's terminal chunk behind the guarded text tail,
+            # which is flushed after the upstream iterator ends.
+            if deferred_finish_chunk is not None:
+                post_finish_chunks.append(chunk)
+                continue
+
             # Native passthrough streams can be bytes; leave them untouched.
             if isinstance(chunk, (bytes, bytearray)):
                 raw_stream_passthrough = True
@@ -2727,6 +2736,10 @@ class OpencodeCompatHandler(CustomLogger):
             raw_chunk_text = reasoning or text
 
             if not raw_chunk_text:
+                choice = _choice(chunk)
+                if choice is not None and _get(choice, "finish_reason", None):
+                    deferred_finish_chunk = chunk
+                    continue
                 if not dsml_mode:
                     yield chunk
                 continue
@@ -2826,7 +2839,12 @@ class OpencodeCompatHandler(CustomLogger):
         if raw_stream_passthrough and not content_collected:
             return
 
-        yield _make_stream_chunk(last_id, last_model, last_created, {"content": ""}, finish_reason="stop")
+        if deferred_finish_chunk is not None:
+            yield deferred_finish_chunk
+            for chunk in post_finish_chunks:
+                yield chunk
+        else:
+            yield _make_stream_chunk(last_id, last_model, last_created, {"content": ""}, finish_reason="stop")
 
     async def _convert_anthropic_messages_stream(
         self,

@@ -4,6 +4,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+from litellm.types.utils import Delta, ModelResponse, StreamingChoices
+
 from opencode_compat_hook.hook import (
     OpencodeCompatHandler,
     _coerce_value_for_schema,
@@ -420,6 +422,51 @@ class HiddenThinkingToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(output_stream.aclose(), timeout=1.0)
 
         self.assertTrue(provider_stream.closed)
+
+    async def test_chat_stream_flushes_guarded_tail_before_finish_reason(self):
+        text = (
+            "The JSON file is **syntactically valid**. ✅\n\n"
+            "I validated `/Users/rmangeol/Library/Application Support/Code/User/"
+            "chatLanguageModels.json` using Python's `json.tool`, which parses the entire "
+            "structure and confirms it's well-formed (correct brackets, commas, quoting, "
+            "and nesting).\n\nNo syntax errors found."
+        )
+
+        def stream_chunk(content=None, finish_reason=None, role=None):
+            response = ModelResponse(id="chatcmpl_test", model="test", stream=True)
+            response.choices = [
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(content=content, role=role),
+                    finish_reason=finish_reason,
+                )
+            ]
+            return response
+
+        async def provider_stream():
+            yield stream_chunk(content="", role="assistant")
+            for offset in range(0, len(text), 3):
+                yield stream_chunk(content=text[offset : offset + 3])
+            yield stream_chunk(finish_reason="stop")
+
+        received = ""
+        output_stream = self.handler.async_post_call_streaming_iterator_hook(
+            None,
+            provider_stream(),
+            {
+                "call_type": "acompletion",
+                "stream": True,
+                "model": "qwen-pgc1",
+                "proxy_server_request": {"url": "/v1/chat/completions"},
+            },
+        )
+        async for item in output_stream:
+            choice = item.choices[0]
+            received += choice.delta.content or ""
+            if choice.finish_reason:
+                break
+
+        self.assertEqual(received, text)
 
     async def test_complete_tool_call_implicitly_closes_unclosed_thinking(self):
         output, current = await feed(
