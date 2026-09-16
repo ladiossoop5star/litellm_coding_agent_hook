@@ -1,7 +1,9 @@
 import asyncio
+import copy
 
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     TOOL_RESULT_IMAGE_BOUNDARY,
+    TOOL_RESULT_IMAGE_HISTORY_PLACEHOLDER,
     TOOL_RESULT_IMAGE_PLACEHOLDER,
 )
 from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
@@ -72,6 +74,32 @@ def assert_no_base64_text(messages):
     for message in messages:
         content = message.get("content")
         assert not (isinstance(content, str) and content.startswith("data:image/"))
+
+
+def openai_image_tool_turn(tool_id, data, text=None):
+    content = []
+    if text is not None:
+        content.append({"type": "text", "text": text})
+    content.append(
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + data},
+        }
+    )
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": tool_id, "content": content},
+    ]
 
 
 def test_single_image_is_structured_then_hoisted():
@@ -167,3 +195,61 @@ def test_async_transform_hoists_image():
     assert tool_messages(outbound)[0]["content"] == TOOL_RESULT_IMAGE_PLACEHOLDER
     assert image_urls_in_user_messages(outbound) == [DATA_URI]
     assert_no_base64_text(outbound)
+
+
+def test_only_newest_image_tool_run_is_hoisted():
+    messages = [
+        *openai_image_tool_turn("toolu_old", "OLD"),
+        {"role": "assistant", "content": "I analyzed the old image."},
+        {"role": "user", "content": "Read another image."},
+        *openai_image_tool_turn("toolu_new", "NEW"),
+    ]
+
+    outbound = OpenAIGPTConfig()._transform_messages(messages, "vision-model")
+
+    assert image_urls_in_user_messages(outbound) == ["data:image/png;base64,NEW"]
+    tools = tool_messages(outbound)
+    assert tools[0]["content"] == TOOL_RESULT_IMAGE_HISTORY_PLACEHOLDER
+    assert tools[1]["content"] == TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert_no_base64_text(outbound)
+
+
+def test_historical_mixed_tool_result_keeps_text_and_marks_omitted_image():
+    messages = [
+        *openai_image_tool_turn("toolu_old", "OLD", text="old image notes"),
+        {"role": "assistant", "content": "Old image handled."},
+        {"role": "user", "content": "Read another image."},
+        *openai_image_tool_turn("toolu_new", "NEW"),
+    ]
+
+    outbound = OpenAIGPTConfig()._transform_messages(messages, "vision-model")
+
+    assert tool_messages(outbound)[0]["content"] == [
+        {"type": "text", "text": "old image notes"},
+        {"type": "text", "text": TOOL_RESULT_IMAGE_HISTORY_PLACEHOLDER},
+    ]
+    assert image_urls_in_user_messages(outbound) == ["data:image/png;base64,NEW"]
+
+
+def test_twelve_historical_images_collapse_to_latest_image():
+    messages = []
+    for index in range(12):
+        messages.extend(openai_image_tool_turn(f"toolu_{index}", f"IMAGE_{index}"))
+        if index < 11:
+            messages.extend(
+                [
+                    {"role": "assistant", "content": f"Analyzed image {index}."},
+                    {"role": "user", "content": "Continue."},
+                ]
+            )
+    original_messages = copy.deepcopy(messages)
+
+    outbound = OpenAIGPTConfig()._transform_messages(messages, "vision-model")
+
+    assert image_urls_in_user_messages(outbound) == ["data:image/png;base64,IMAGE_11"]
+    tools = tool_messages(outbound)
+    assert [tool["content"] for tool in tools[:-1]] == [
+        TOOL_RESULT_IMAGE_HISTORY_PLACEHOLDER
+    ] * 11
+    assert tools[-1]["content"] == TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert messages == original_messages
